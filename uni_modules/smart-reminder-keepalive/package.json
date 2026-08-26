@@ -1,0 +1,8 @@
+{
+  "id": "smart-reminder-keepalive",
+  "displayName": "智能提醒保活",
+  "version": "1.0.0",
+  "description": "Android 前台服务保活：息屏/后台也能自动持续语音播报提醒",
+  "uni_modules": {
+  }
+}

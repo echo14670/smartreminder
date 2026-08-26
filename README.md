@@ -1,0 +1,103 @@
+# 智能提醒（smartreminder）
+
+双端联动的语音提醒 App：一台手机设为主机（设置“今日是否提醒”、提醒时间、提醒内容），另一台设为从机，每天在指定时间持续语音播报提醒，直到从机用户手动确认。基于 uni-app（Vue3）+ uniCloud + uni-push 2.0 + 手机系统 TTS + Android 前台服务保活（方案B）。
+
+## 功能
+
+- 主机：开启/关闭今日提醒、设定时间、编辑提醒内容，一键保存到云端
+- 可靠同步（ACK 协议，无轮询）：
+  1. 主机保存配置，云函数生成版本号并写入云端，同时推送“配置已更新”给所有从机
+  2. 从机收到推送后立即拉取新配置，并调用 `confirm-sync` 上报确认（ACK）
+  3. 主机云函数等待约 10 秒，未收到确认的从机自动重传一次；主机界面显示“从机已确认 / 未确认(0/1)”
+  4. 兜底：从机在启动/回到前台时同步，另有“每天提醒前 2 分钟”定时拉取（`ENABLE_DAILY_FALLBACK` 常量可关）
+- 从机播报：到点后全屏遮罩 + 每 10 秒重复语音播报 + 震动，直到点击“确认已收到”
+- 息屏自动播报（方案B，仅 Android）：原生前台服务 + 精确闹钟，App 在后台/息屏时也能到点自动持续语音播报
+- 语音：App 端直接调用手机系统 TTS（Android `TextToSpeech` / iOS `AVSpeechSynthesizer`）；H5/小程序端退化为 Toast 提示
+
+## 部署步骤（一次性）
+
+1. HBuilderX 登录 DCloud 账号，获取 appid（manifest 可视化界面点“获取 appid”）
+2. 右键 `uniCloud-aliyun` -> 创建并关联阿里云服务空间（建议按量计费，见费用说明）
+3. 展开 `uniCloud-aliyun/cloudfunctions`，分别右键 `set-config`、`get-config`、`register-device`、`confirm-sync` -> 上传部署
+4. 开通 uni-push：uniCloud 网页控制台（https://unicloud.dcloud.net.cn/）-> 推送设置 -> 开通（uni-push 2.0）
+5. 建议：在云函数配置里把 `set-config` 的超时时间调到 60 秒（默认 5 秒可能不够等待确认/重传）
+6. 在 HBuilderX 中确认 manifest 的 `App模块配置 -> Push（消息推送）` 已勾选（uni-push 2.0），然后：
+   - 测试：直接“运行到手机或模拟器”（标准基座）可验证同步/推送/前台 TTS；**息屏保活需要自定义基座**（见下）
+   - 正式：`发行 -> 原生App-云打包` 生成安装包（离线推送/厂商通道需在控制台配置并勾选厂商）
+7. 两台手机分别安装（一台设主机、一台设从机）
+
+## 方案B：Android 息屏自动持续语音播报（前台服务保活）
+
+从机在 Android 上通过 `uni_modules/smart-reminder-keepalive`（UTS 插件）实现“息屏也能自动语音播报”：
+
+- 原理：从机首次同步时启动一个**原生前台服务**（常驻通知“智能提醒服务运行中”），用**精确闹钟**在提醒时间唤醒 CPU；到点后由服务内的原生 `TextToSpeech` 每 10 秒持续播报，直到用户在 App 里点“确认已收到”（或切换角色时自动停止）。播报期间持有唤醒锁，避免息屏后 CPU 休眠中断。
+- 与页面的配合：原生开始/停止播报会通过回调通知页面显示/隐藏全屏遮罩；页面 JS 不再重复发声（避免双重播报）；App 被杀后重新打开，也会根据原生服务状态恢复遮罩。
+- 每天只触发一次：原生服务和页面各自记录“今天已触发”，确认后当天不再重复。
+
+启用步骤（重要，新手照做）：
+
+1. 插件包含原生配置（AndroidManifest.xml），**标准基座不支持**，必须：
+   - 调试：HBuilderX 菜单 `运行 -> 运行到手机或模拟器 -> 制作自定义调试基座`（云打包生成，需已配置证书），再运行到手机
+   - 发布：`发行 -> 原生App-云打包`，使用自有证书 `smartreminder.keystore`（见“发布信息”）
+2. 手机首次进入从机模式时会申请“通知”权限（Android 13+ 必点“允许”，否则常驻通知不显示，但服务仍会运行）
+3. 建议到手机系统设置里把应用加入：电池优化白名单（不允许电池优化）、自启动白名单（小米/华为/OPPO/vivo 等各品牌“应用启动管理”里允许后台运行），并把应用从“最近任务”里锁定，防止被一键清理杀掉
+4. 真机测试方法：设好提醒时间后按电源键息屏，等到点看是否自动播报；也可在从机页面点“测试语音播报”验证 TTS 正常
+
+### 防“清后台/强行停止”（代码已内置的防御）
+
+- **配置持久化**：提醒配置写入本地（SharedPreferences），进程被杀/重启手机后不丢失
+- **划掉自动复活**：用户从最近任务划掉应用时，`onTaskRemoved` 会安排一个 3 秒后的系统“闹钟”尝试重新拉起服务（30 秒内连续被清 2 次会自动放弃，避免被系统判定为恶意自启）
+- **开机自启**：重启手机后（`BOOT_COMPLETED`）自动恢复前台服务与闹钟，前提是应用未被“强行停止”过
+- **一键保活设置**：从机页面有“保活设置（电池白名单/自启动）”按钮，一键跳转电池优化白名单申请页和应用详情页
+
+用户侧要做的（效果占大头，务必照做）：
+
+1. 打开 App 后点“保活设置”，按系统提示允许“忽略电池优化”
+2. 到系统“应用管理/应用启动管理”里允许本应用自启动和后台运行（小米/华为/OPPO/vivo 等品牌各有入口）
+3. 在“最近任务”界面把本应用**下拉锁定**（防止一键清理），不要点“强行停止”，不要用清理类 App 清理它
+4. 平时正常退出：直接按 Home 键或息屏即可，不需要退出应用
+
+已知限制（Android 系统层面的现实，请如实告知用户）：
+
+- 用户主动“强行停止”（设置里的 Force Stop）后，**任何 App 都无法自己复活**（Android 铁律，系统闹钟也一样），只有再次打开 App 才会恢复——本应用打开时会自动恢复服务
+- “清后台”可以通过白名单 + 锁定 + 自动复活把失败率降到很低，但不同厂商 ROM 的杀后台策略不同，做不到数学上的 100%
+- iOS 系统不允许第三方 App 息屏后持续播放语音（iOS 上从机功能不完整），所以**从机只部署 Android**；iOS 只作主机（设置提醒，不播报）
+- 未授予“闹钟和提醒”精确闹钟权限（Android 12+）时，会自动退化为系统“闹钟”类型或 1 分钟内模糊闹钟，仍有较强可靠性；建议在系统设置里允许“闹钟和提醒”
+
+## 费用说明（按量计费，年成本约 10-20 元）
+
+- 成本大头是“云函数有调用的小时数”：阿里云规定某小时只要有调用，最少计 90 GBs（约 0.01 元/小时）
+- 本设计下：主机每天保存 1-3 次 + 从机收到推送/启动/每日兜底，每月有调用小时约 90-150 小时 -> 约 0.9-1.5 元/月
+- 每日兜底开关（`ENABLE_DAILY_FALLBACK`）保留的成本约 0.3 元/月，作为推送失效时的保险；如确认推送足够可靠，可改为 `false` 省掉
+- 建议在 uniCloud 控制台为各资源设置每日上限，并在监控告警里打开余额/用量提醒，防止意外超支
+
+## 使用方法
+
+1. 主机：选择“本机作为主机” -> 打开“今日是否提醒” -> 设时间/内容 -> 保存并同步（页面显示从机是否已确认）
+2. 从机（Android）：选择“本机作为从机”，主机保存后 1-2 秒内自动同步并确认；页面显示“后台保活：前台服务运行中”即表示息屏可播报
+3. 到点后从机全屏播报（息屏时由原生服务发声），点“确认已收到”停止；主机端可看到“从机已确认”
+
+## 目录结构
+
+- `pages/index/index.vue` 主页面（角色选择 / 主机设置 / 从机同步 / ACK 上报 / 持续播报遮罩 / 保活插件接入）
+- `App.vue` 推送注册与“配置已更新”监听
+- `utils/tts.js` 系统 TTS 语音播报工具（speak / stopSpeaking，前台兜底）
+- `uni_modules/smart-reminder-keepalive/` 方案B UTS 插件（仅 Android）
+  - `utssdk/app-android/hybrid.kt` 原生前台服务：常驻通知、精确闹钟、原生 TTS 持续播报、唤醒锁
+  - `utssdk/app-android/index.uts` 插件导出 API（startKeepAlive / updateReminder / stopSpeech / stopKeepAlive / getState / onStateChanged）
+  - `utssdk/app-android/AndroidManifest.xml` 前台服务与权限声明（自定义基座/云打包生效）
+- `uniCloud-aliyun/cloudfunctions/set-config` 写入配置 + 推送 + 等待确认 + 重传
+- `uniCloud-aliyun/cloudfunctions/get-config` 读取配置
+- `uniCloud-aliyun/cloudfunctions/register-device` 注册从机推送 clientid
+- `uniCloud-aliyun/cloudfunctions/confirm-sync` 从机确认（ACK）
+- `manifest.json` 应用配置（已开启 uni-push 2.0）
+- `pages.json` 页面路由
+
+## 发布信息
+
+- 应用名：智能提醒（manifest.json 的 name）
+- APPID：__UNI__00A13F1
+- Android 包名：com.lin.smartreminder（manifest.json app-plus.distribute.android.packagename）
+- 签名证书：自有 Android 签名证书（别名 smartreminder），务必另行安全保管，**切勿提交到代码仓库**；云打包时在 HBuilderX 上传使用
+- 云打包：自有证书上传 smartreminder.keystore，包名必须与上面一致
+- 插件要求：HBuilderX 4.0+（UTS 原生混编需 HBuilderX 4.25+，编译 SDK 34）
