@@ -1,9 +1,7 @@
 <template>
   <view class="page">
     <!-- 未选择角色 -->
-    <view v-if="!mode" class="card">
-      <text class="page-title">智能提醒</text>
-      <text class="desc">两台手机分别安装本 App：一台设为主机（设置提醒），一台设为从机（定点语音播报）。主机保存后，通过云推送通知从机，从机确认后主机显示同步结果。</text>
+    <view v-if="!mode" class="card card-center">
       <button class="btn" type="primary" @click="chooseMode('host')">本机作为主机（设置提醒）</button>
       <button class="btn" type="default" @click="chooseMode('slave')">本机作为从机（接收提醒）</button>
     </view>
@@ -11,27 +9,56 @@
     <!-- 主机面板 -->
     <view v-else-if="mode === 'host'" class="card">
       <view class="header">
-        <text class="page-title">主机设置</text>
+        <text class="page-title">主机</text>
         <text class="tag">本机：主机</text>
       </view>
       <view class="row">
-        <text class="label">今日是否提醒</text>
-        <switch :checked="enabled" color="#007aff" @change="onEnabledChange" />
-      </view>
-      <view class="row">
-        <text class="label">提醒时间</text>
-        <picker mode="time" :value="time" @change="onTimeChange">
-          <view class="time-value">{{ time }}</view>
-        </picker>
-      </view>
-      <view class="row col">
-        <text class="label">提醒内容（从机语音播报）</text>
-        <input class="input" v-model="content" placeholder="例如：该喝水啦" />
+        <text class="label">全部提醒</text>
+        <switch :checked="masterEnabled" color="#007aff" @change="onMasterEnabledChange" />
       </view>
       <view class="row">
         <text class="label">同步状态</text>
-        <text class="muted">{{ syncStatus }}</text>
+        <text :class="syncStatus === '待同步' ? 'state-warn' : (syncStatus === '已同步' ? 'state-on' : 'muted')">{{ syncStatus }}</text>
       </view>
+
+      <view v-for="(r, idx) in reminders" :key="r.id" class="reminder-item">
+        <view class="row">
+          <text class="label">提醒 {{ idx + 1 }}</text>
+          <switch :checked="r.enabled" color="#007aff" @change="onReminderEnabledChange(idx, $event)" />
+        </view>
+        <view class="row col">
+          <text class="label">提醒内容</text>
+          <input class="input" v-model="r.content" placeholder="例如：该喝水啦" @input="markDirty" />
+        </view>
+        <view class="times-block">
+          <text class="label">每日提醒时间</text>
+          <view class="times-list">
+            <view v-for="(t, ti) in r.times" :key="t + '_' + ti" class="time-chip">
+              <picker mode="time" :value="t" @change="onTimeChange(idx, ti, $event)">
+                <view class="time-value">{{ t }}</view>
+              </picker>
+              <text class="time-del" @click="removeTime(idx, ti)">×</text>
+            </view>
+            <button class="time-add" type="default" size="mini" @click="addTime(idx)">+ 添加时间</button>
+          </view>
+        </view>
+        <view class="row" @click="toggleRecords(r.id)">
+          <text class="label">提醒记录（最近30条）</text>
+          <text class="muted">{{ recordExpanded[r.id] ? '收起 ▲' : '展开 ▼' }}</text>
+        </view>
+        <view v-if="recordExpanded[r.id]" class="records-block">
+          <text v-if="recordsLoading[r.id]" class="muted">加载中…</text>
+          <text v-else-if="reminderRecords[r.id] && reminderRecords[r.id].length" class="record-tip">最近 {{ reminderRecords[r.id].length }} 条</text>
+          <view v-for="(rec, ri) in reminderRecords[r.id] || []" :key="ri" class="record-item">
+            <text class="record-time">{{ rec.timeText }}</text>
+            <text class="record-content">{{ rec.content || '（无内容）' }}</text>
+          </view>
+          <text v-if="!recordsLoading[r.id] && !(reminderRecords[r.id] && reminderRecords[r.id].length)" class="muted">暂无记录</text>
+        </view>
+        <button class="btn link" type="warn" plain @click="removeReminder(idx)">删除这条提醒</button>
+      </view>
+
+      <button class="btn" type="default" @click="addReminder">+ 添加一条提醒</button>
       <button class="btn" type="primary" @click="pushConfig">保存并同步</button>
       <button class="btn link" type="warn" plain @click="resetMode">切换角色</button>
     </view>
@@ -42,12 +69,15 @@
         <text class="page-title">从机</text>
         <text class="tag">本机：从机</text>
       </view>
-      <view class="row"><text class="label">今日提醒</text><text :class="reminderEnabled ? 'state-on' : 'state-off'">{{ reminderEnabled ? '开' : '关' }}</text></view>
-      <view class="row"><text class="label">提醒时间</text><text class="value">{{ reminderTime || '--' }}</text></view>
-      <view class="row"><text class="label">提醒内容</text><text class="value">{{ reminderContent || '--' }}</text></view>
-      <view class="row"><text class="label">同步方式</text><text class="muted">云推送(确认重传) + 每日兜底</text></view>
-      <view class="row"><text class="label">上次同步</text><text class="muted">{{ lastSyncText }}</text></view>
-      <view class="row"><text class="label">上次播报</text><text class="muted">{{ lastSpeakText }}</text></view>
+      <view class="row"><text class="label">今日提醒</text><text :class="slaveEnabled ? 'state-on' : 'state-off'">{{ slaveEnabled ? '开' : '关' }}</text></view>
+      <view class="row"><text class="label">提醒数量</text><text class="value">{{ slaveReminders.length }} 条 · 每日 {{ totalSlaveTimes }} 次</text></view>
+      <view v-for="(r, idx) in slaveReminders" :key="r.id" class="reminder-item">
+        <view class="row">
+          <text class="label">{{ idx + 1 }}.{{ r.content || '（未填内容）' }}</text>
+          <text :class="r.enabled ? 'state-on' : 'state-off'">{{ r.enabled ? '开' : '关' }}</text>
+        </view>
+        <view class="row"><text class="label">时间</text><text class="value">{{ r.times.join('、') || '--' }}</text></view>
+      </view>
       <!-- #ifdef APP-ANDROID -->
       <view class="row"><text class="label">后台保活</text><text :class="keepAliveActive ? 'state-on' : 'state-off'">{{ keepAliveActive ? '前台服务运行中（息屏可播报）' : '未启用' }}</text></view>
       <!-- #endif -->
@@ -57,14 +87,13 @@
       <button class="btn" type="primary" @click="testSpeak">测试语音播报</button>
       <button class="btn" type="default" @click="syncNow">立即同步</button>
       <button class="btn link" type="warn" plain @click="resetMode">切换角色</button>
-      <view class="tip">提示：收到主机推送后自动拉取新配置并上报确认；主机未收到确认会重传一次。另有每天提醒前 2 分钟的兜底拉取（可在代码里关闭）。到点后全屏持续语音播报，直到点击“确认已收到”。Android 从机开启“后台保活”后，息屏/锁屏也能自动持续语音播报（需云打包/自定义基座，并允许应用在后台运行）。</view>
     </view>
 
     <!-- 持续播报遮罩 -->
     <view v-if="reminderActive" class="mask">
       <view class="mask-card">
         <text class="mask-title">⏰ 提醒时间到</text>
-        <text class="mask-content">{{ reminderContent || '该做正事啦' }}</text>
+        <text class="mask-content">{{ remindContent || '该做正事啦' }}</text>
         <text class="mask-sub">持续语音播报中，请确认收到</text>
         <button class="mask-btn" type="primary" @click="confirmReminder">确认已收到</button>
       </view>
@@ -75,56 +104,107 @@
 <script>
 import { speak, stopSpeaking } from '@/utils/tts.js'
 // #ifdef APP-ANDROID
-// 方案B：Android 息屏持续语音播报（前台服务保活插件）
+// 方案B：Android 息屏持续语音播报（前台服务保活插件，多提醒）
 import {
   startKeepAlive,
   updateReminder,
   stopSpeech,
   stopKeepAlive,
   getState,
-  onStateChanged
+  onStateChanged,
+  getPendingRecords,
+  clearPendingRecords
 } from '@/uni_modules/smart-reminder-keepalive'
 // #endif
 
 const REPEAT_INTERVAL = 10000
-// 每日兜底拉取开关：推送失效时的保险（每天 1 次云函数调用，约 0.3 元/月）
+// 每日兜底拉取开关：推送失效时的保险（每天约 1 次云函数调用）
 const ENABLE_DAILY_FALLBACK = true
+// 仅在“重新回到前台”且即将到提醒时才同步，避免频繁打开 App 产生大量云函数调用
+const SYNC_NEAR_MINUTES = 15
+const SYNC_NEAR_COOLDOWN_MS = 5 * 60 * 1000
+
+function makeReminder() {
+  return {
+    id: 'r' + Date.now() + Math.floor(Math.random() * 1000),
+    enabled: true,
+    times: ['08:00'],
+    content: '该做正事啦'
+  }
+}
 
 export default {
   data() {
     return {
       mode: '',
-      enabled: true,
-      time: '08:00',
-      content: '该做正事啦',
+      // 主机配置
+      masterEnabled: true,
+      reminders: [makeReminder()],
       syncStatus: '未同步',
-      reminderEnabled: false,
-      reminderTime: '',
-      reminderContent: '',
+      // 从机展示
+      slaveEnabled: false,
+      slaveReminders: [],
       lastSyncText: '--',
       lastSpeakText: '--',
+      // 调度
       dailyTimer: null,
+      nextTimer: null,
       repeatTimer: null,
-      lastTriggerDate: '',
+      lastTriggerKey: '',
+      lastFallbackDate: '',
       reminderActive: false,
+      remindContent: '该做正事啦',
+      // 保活
       keepAliveActive: false,
-      keepAliveSupported: false
+      keepAliveSupported: false,
+      // 同步节流
+      _coldStart: true,
+      _lastSyncAt: 0,
+      // 提醒记录（主机展示）
+      reminderRecords: {},
+      recordExpanded: {},
+      recordsLoading: {}
+    }
+  },
+  computed: {
+    totalSlaveTimes() {
+      let n = 0
+      for (const r of this.slaveReminders || []) {
+        if (r.enabled) n += (r.times || []).length
+      }
+      return n
     }
   },
   onLoad() {
     this.mode = uni.getStorageSync('role') || ''
     const config = uni.getStorageSync('hostConfig') || {}
-    if (config.enabled !== undefined) this.enabled = config.enabled
-    if (config.time) this.time = config.time
-    if (config.content) this.content = config.content
+    this.normalizeHostConfig(config)
+    this.refreshSyncState()
+    this._coldStart = true
+    this._lastSyncAt = 0
     uni.$on('config-updated', this.onConfigUpdated)
+    // #ifdef H5
+    // 浏览器多标签页测试：主机保存后，同源 storage 事件触发从机立即同步
+    this._h5Storage = (e) => {
+      if (e && e.key && e.key.indexOf('__slave_sync_notify__') !== -1 && this.mode === 'slave') {
+        this.syncNow()
+      }
+    }
+    window.addEventListener('storage', this._h5Storage)
+    // #endif
     // #ifdef APP-ANDROID
     this.setupKeepAlive()
     // #endif
   },
   onShow() {
     if (this.mode === 'slave') {
-      this.syncNow()
+      // 冷启动（App 被杀后重新打开）必须同步，恢复原生服务与最新配置
+      if (this._coldStart) {
+        this._coldStart = false
+        this.syncNow()
+      } else if (this.shouldSyncOnShow()) {
+        this.syncNow()
+      }
       // #ifdef APP-ANDROID
       this.ensureNotificationPermission()
       // #endif
@@ -133,9 +213,14 @@ export default {
   onUnload() {
     this.stopRepeat()
     this.clearDailyTimer()
+    this.clearNextTimer()
     uni.$off('config-updated', this.onConfigUpdated)
+    // #ifdef H5
+    if (this._h5Storage) window.removeEventListener('storage', this._h5Storage)
+    // #endif
   },
   methods: {
+    // ---------- 角色 ----------
     chooseMode(mode) {
       this.mode = mode
       uni.setStorageSync('role', mode)
@@ -149,31 +234,163 @@ export default {
     resetMode() {
       this.stopRepeat()
       this.clearDailyTimer()
+      this.clearNextTimer()
       stopSpeaking()
       // #ifdef APP-ANDROID
       this.safeStopKeepAlive()
       // #endif
       this.reminderActive = false
+      this.slaveReminders = []
+      this.slaveEnabled = false
       uni.removeStorageSync('role')
       this.mode = ''
     },
-    onConfigUpdated() {
-      // 主机修改配置后，从机立即重新同步
-      if (this.mode === 'slave') {
-        this.syncNow()
+
+    // ---------- 配置归一化 ----------
+    normalizeHostConfig(cfg) {
+      if (!cfg) return
+      if (Array.isArray(cfg.reminders)) {
+        this.masterEnabled = cfg.masterEnabled !== false
+        this.reminders = cfg.reminders.map((r) => ({
+          id: r.id || 'r' + Date.now(),
+          enabled: r.enabled !== false,
+          times: Array.isArray(r.times) && r.times.length ? r.times.slice() : ['08:00'],
+          content: r.content || ''
+        }))
+        if (!this.reminders.length) this.reminders = [makeReminder()]
+      } else if (cfg.time || cfg.content) {
+        // 旧格式迁移：单条提醒
+        this.masterEnabled = cfg.enabled !== false
+        this.reminders = [{
+          id: 'r1',
+          enabled: true,
+          times: [cfg.time || '08:00'],
+          content: cfg.content || ''
+        }]
       }
     },
-    onEnabledChange(e) {
-      this.enabled = e.detail.value
+    normalizeServerConfig(data) {
+      if (!data) return { enabled: false, reminders: [] }
+      if (Array.isArray(data.reminders)) {
+        const reminders = data.reminders
+          .map((r) => ({
+            id: r.id || 'r' + Date.now(),
+            enabled: r.enabled !== false,
+            times: Array.isArray(r.times) ? r.times.slice() : [],
+            content: r.content || ''
+          }))
+          .filter((r) => r.times.length > 0)
+        return { enabled: data.masterEnabled !== false, reminders }
+      }
+      // 旧格式
+      if (data.time || data.content) {
+        return {
+          enabled: data.enabled !== false,
+          reminders: [{ id: 'r1', enabled: true, times: [data.time || '08:00'], content: data.content || '' }]
+        }
+      }
+      return { enabled: false, reminders: [] }
     },
-    onTimeChange(e) {
-      this.time = e.detail.value
+
+    // ---------- 提醒编辑 ----------
+    onMasterEnabledChange(e) {
+      this.masterEnabled = e.detail.value
+      this.markDirty()
     },
+    onReminderEnabledChange(idx, e) {
+      const r = this.reminders[idx]
+      if (r) r.enabled = e.detail.value
+      this.markDirty()
+    },
+    onTimeChange(idx, ti, e) {
+      const r = this.reminders[idx]
+      if (r && r.times && r.times[ti] !== undefined) r.times[ti] = e.detail.value
+      this.markDirty()
+    },
+    addTime(idx) {
+      const r = this.reminders[idx]
+      if (r) r.times = (r.times || []).concat('12:00')
+      this.markDirty()
+    },
+    removeTime(idx, ti) {
+      const r = this.reminders[idx]
+      if (r && r.times && r.times.length > 1) r.times.splice(ti, 1)
+      this.markDirty()
+    },
+    addReminder() {
+      this.reminders.push(makeReminder())
+      this.markDirty()
+    },
+    removeReminder(idx) {
+      this.reminders.splice(idx, 1)
+      if (!this.reminders.length) this.reminders = [makeReminder()]
+      this.markDirty()
+    },
+    // ---------- 提醒记录（主机展示） ----------
+    toggleRecords(id) {
+      this.recordExpanded[id] = !this.recordExpanded[id]
+      if (this.recordExpanded[id] && !this.reminderRecords[id]) {
+        this.loadRecords(id)
+      }
+    },
+    loadRecords(id) {
+      this.recordsLoading[id] = true
+      uniCloud.callFunction({
+        name: 'get-records',
+        data: { reminderIds: [id] }
+      }).then((res) => {
+        const data = (res.result && res.result.data) || {}
+        this.reminderRecords[id] = (data[id] || []).map((r) => ({
+          time: r.time,
+          timeText: this.formatRecordTime(r.time),
+          content: r.content || ''
+        }))
+      }).catch((err) => {
+        console.warn('读取提醒记录失败', err)
+        this.reminderRecords[id] = []
+      }).finally(() => {
+        this.recordsLoading[id] = false
+      })
+    },
+    formatRecordTime(ts) {
+      if (!ts) return '--'
+      const d = new Date(Number(ts))
+      if (isNaN(d.getTime())) return '--'
+      return this.hhmm(d) + ' · ' + this.ymd(d)
+    },
+    // 本地配置快照，用于判断是否与“最后一次成功同步”一致
+    configFingerprint() {
+      return JSON.stringify({
+        masterEnabled: this.masterEnabled,
+        reminders: (this.reminders || []).map((r) => ({
+          id: r.id,
+          enabled: r.enabled,
+          times: (r.times || []).slice(),
+          content: r.content || ''
+        }))
+      })
+    },
+    refreshSyncState() {
+      const synced = uni.getStorageSync('syncedConfigFp') || ''
+      const fp = this.configFingerprint()
+      this.syncStatus = (synced && synced === fp) ? '已同步' : ((this.reminders && this.reminders.length) ? '待同步' : '未同步')
+    },
+    markDirty() {
+      this.syncStatus = '待同步'
+    },
+
+    // ---------- 主机推送 ----------
     pushConfig() {
       const data = {
-        enabled: this.enabled,
-        time: this.time,
-        content: this.content
+        masterEnabled: this.masterEnabled,
+        reminders: this.reminders
+          .map((r) => ({
+            id: r.id,
+            enabled: r.enabled,
+            times: (r.times || []).slice(),
+            content: r.content
+          }))
+          .filter((r) => r.times.length > 0)
       }
       uni.setStorageSync('hostConfig', data)
       this.syncStatus = '同步中...'
@@ -181,66 +398,112 @@ export default {
         name: 'set-config',
         data
       }).then((res) => {
-        const r = (res && res.result) || {}
-        if (r.slaveCount > 0 && r.ackedCount === r.slaveCount) {
-          this.syncStatus = '已同步，从机已确认 ' + this.nowText()
-        } else if (r.slaveCount > 0) {
-          this.syncStatus = '已同步，从机未确认(' + (r.ackedCount || 0) + '/' + r.slaveCount + ')'
-        } else {
-          this.syncStatus = '已同步（暂无在线从机）'
-        }
+        // 同步成功：记录本次配置快照，后续本地修改会再次变为“待同步”
+        uni.setStorageSync('syncedConfigFp', this.configFingerprint())
+        this.syncStatus = '已同步'
+        console.log('set-config 返回:', (res && res.result) || {})
+        // #ifdef H5
+        // 浏览器多标签页测试：通知同源其他标签页（从机测试页）立即同步
+        uni.setStorageSync('__slave_sync_notify__', String(Date.now()))
+        // #endif
       }).catch((err) => {
         this.syncStatus = '同步失败'
         this.showCloudError(err)
       })
+    },
+
+    // ---------- 从机同步 ----------
+    // 收到“配置已更新”推送：从机立即拉取最新配置并补传本地提醒记录
+    onConfigUpdated() {
+      if (this.mode === 'slave') {
+        this.syncNow()
+      }
     },
     syncNow() {
       uniCloud.callFunction({
         name: 'get-config'
       }).then((res) => {
         const data = res.result && res.result.data
-        if (data) {
-          this.reminderEnabled = !!data.enabled
-          this.reminderTime = data.time || ''
-          this.reminderContent = data.content || ''
-          // 上报确认（ACK），让主机知道已收到最新配置
-          this.ackSync(data.version)
-        } else {
-          this.reminderEnabled = false
-          this.reminderTime = ''
-          this.reminderContent = ''
-        }
+        const cfg = this.normalizeServerConfig(data)
+        this.slaveEnabled = cfg.enabled
+        this.slaveReminders = cfg.reminders
         this.lastSyncText = this.nowText()
+        this._lastSyncAt = Date.now()
         this.scheduleDailySync()
         // #ifdef APP-ANDROID
         this.syncKeepAlive()
+        this.flushPendingRecords()
         // #endif
-        this.checkReminder()
+        this.rescheduleNext()
       }).catch((err) => {
         this.lastSyncText = '同步失败'
         this.showCloudError(err)
       })
     },
-    ackSync(version) {
-      if (!version) return
-      const clientid = uni.getStorageSync('pushCid')
-      if (!clientid) return
+    // 从机本地触发时直接上报一条记录（无原生保活/前台情况）
+    logTrigger(reminderId, content) {
       uniCloud.callFunction({
-        name: 'confirm-sync',
-        data: { clientid, version }
-      }).catch((err) => console.warn('确认同步失败', err))
+        name: 'log-reminder',
+        data: { reminders: [{ reminderId, content: content || '', time: Date.now() }] }
+      }).catch((err) => console.warn('记录提醒触发失败', err))
     },
-    // 每天在提醒时间前 2 分钟拉一次配置，作为推送失效时的兜底
+    // 上传原生保活记录的本地待上传队列（覆盖“进程被杀”期间的触发）
+    flushPendingRecords() {
+      // #ifdef APP-ANDROID
+      if (!this.keepAliveSupported) return
+      let json = ''
+      try {
+        json = getPendingRecords()
+      } catch (e) {
+        return
+      }
+      let arr = []
+      try {
+        arr = JSON.parse(json || '[]')
+        if (!Array.isArray(arr)) arr = []
+      } catch (e) {
+        arr = []
+      }
+      if (!arr.length) return
+      const reminders = arr.map((r) => ({
+        reminderId: r.reminderId,
+        content: r.content || '',
+        time: Number(r.time) || Date.now()
+      }))
+      uniCloud.callFunction({
+        name: 'log-reminder',
+        data: { reminders }
+      }).then((res) => {
+        const r = res && res.result
+        if (r && r.code === 0) {
+          try {
+            clearPendingRecords()
+          } catch (e) {}
+        } else {
+          console.warn('补传提醒记录未成功，保留本地队列', r)
+        }
+      }).catch((err) => console.warn('补传提醒记录失败', err))
+      // #endif
+    },
+    // 每天在最早提醒前 2 分钟拉一次配置，作为推送失效时的兜底（每天最多 1 次）
     scheduleDailySync() {
-      if (!ENABLE_DAILY_FALLBACK || !this.reminderTime) return
+      if (!ENABLE_DAILY_FALLBACK) return
       this.clearDailyTimer()
-      const parts = this.reminderTime.split(':')
-      const target = new Date()
-      target.setHours(parseInt(parts[0], 10), parseInt(parts[1], 10), 0, 0)
-      let delay = target.getTime() - 2 * 60 * 1000 - Date.now()
+      if (this.mode !== 'slave' || !this.slaveEnabled) return
+      const slots = this.collectSlots()
+      if (!slots.length) return
+      const earliest = slots.reduce((a, b) => (b.date < a.date ? b : a))
+      const target = earliest.date.getTime() - 2 * 60 * 1000
+      let delay = target - Date.now()
       if (delay < 0) delay += 24 * 60 * 60 * 1000
       this.dailyTimer = setTimeout(() => {
-        this.syncNow()
+        const today = this.ymd(new Date())
+        if (this.lastFallbackDate !== today) {
+          this.lastFallbackDate = today
+          this.syncNow()
+        } else {
+          this.scheduleDailySync()
+        }
       }, delay)
     },
     clearDailyTimer() {
@@ -249,29 +512,87 @@ export default {
         this.dailyTimer = null
       }
     },
-    checkReminder() {
-      if (!this.reminderEnabled || !this.reminderTime) return
+
+    // ---------- 从机 JS 调度 ----------
+    // 下一个即将到来的提醒（含今天未到的时间点，否则是明天最早）
+    nextSlotDate() {
+      const slots = this.collectSlots()
+      if (!slots.length) return null
+      let best = null
+      for (const s of slots) {
+        if (!best || s.date < best.date) best = s
+      }
+      return best
+    },
+    // 重新回到前台时，是否值得同步一次
+    shouldSyncOnShow() {
+      const now = Date.now()
+      // 距上次同步太近，不重复调用
+      if (now - this._lastSyncAt < SYNC_NEAR_COOLDOWN_MS) return false
+      // 下一个提醒即将到来，最后一次确保拿到最新配置
+      const next = this.nextSlotDate()
+      if (next && next.date.getTime() - now <= SYNC_NEAR_MINUTES * 60 * 1000) return true
+      return false
+    },
+    collectSlots() {
+      const out = []
       const now = new Date()
-      const today = this.ymd(now)
-      // 每天只进入一次提醒状态（持续播报直到用户确认）
-      if (today === this.lastTriggerDate) return
-      // 到达提醒时间后的 5 分钟窗口内触发，兼容定时误差
-      const parts = this.reminderTime.split(':')
-      const target = new Date()
-      target.setHours(parseInt(parts[0], 10), parseInt(parts[1], 10), 0, 0)
-      const diff = now.getTime() - target.getTime()
-      if (diff >= 0 && diff <= 5 * 60 * 1000) {
-        this.lastTriggerDate = today
-        this.lastSpeakText = this.nowText()
-        this.startReminder()
+      for (const r of this.slaveReminders || []) {
+        if (!r.enabled) continue
+        for (const t of (r.times || [])) {
+          const parts = String(t).split(':')
+          if (parts.length < 2) continue
+          const h = parseInt(parts[0], 10)
+          const m = parseInt(parts[1], 10)
+          if (isNaN(h) || isNaN(m)) continue
+          const d = new Date()
+          d.setHours(h, m, 0, 0)
+          if (d.getTime() <= now.getTime()) d.setDate(d.getDate() + 1)
+          out.push({ key: r.id + '@' + t, time: t, content: r.content, date: d })
+        }
+      }
+      return out
+    },
+    rescheduleNext() {
+      this.clearNextTimer()
+      if (this.mode !== 'slave' || !this.slaveEnabled) return
+      const slots = this.collectSlots()
+      if (!slots.length) return
+      const now = Date.now()
+      let best = null
+      for (const s of slots) {
+        const d = s.date.getTime()
+        if (d > now && (!best || d < best.date.getTime())) best = s
+      }
+      if (!best) return
+      this.nextTimer = setTimeout(() => this.onSlotFire(best), best.date.getTime() - now)
+    },
+    clearNextTimer() {
+      if (this.nextTimer) {
+        clearTimeout(this.nextTimer)
+        this.nextTimer = null
       }
     },
-    startReminder() {
+    onSlotFire(slot) {
+      const today = this.ymd(new Date())
+      const key = slot.key + '#' + today
+      if (this.lastTriggerKey === key) {
+        this.rescheduleNext()
+        return
+      }
+      this.lastTriggerKey = key
+      this.remindContent = slot.content || '该做正事啦'
+      this.startReminder(slot.key.split('@')[0])
+      this.rescheduleNext()
+    },
+    startReminder(reminderId) {
       this.reminderActive = true
       uni.vibrateLong()
       this.lastSpeakText = this.nowText()
       if (this.keepAliveActive) {
-        // 方案B：由原生前台服务持续播报（息屏/后台也可靠），JS 只负责界面遮罩
+        // 方案B：由原生前台服务持续播报（息屏/后台也可靠），JS 只负责界面遮罩；
+        // 原生会在开始播报时写入本地队列，这里负责上传补传
+        this.flushPendingRecords()
         return
       }
       this.speakContent()
@@ -279,9 +600,12 @@ export default {
       this.repeatTimer = setInterval(() => {
         this.speakContent()
       }, REPEAT_INTERVAL)
+      if (reminderId) {
+        this.logTrigger(reminderId, this.remindContent)
+      }
     },
     speakContent() {
-      speak(this.reminderContent || '现在是' + this.reminderTime + '，该做正事啦')
+      speak(this.remindContent || '该做正事啦')
     },
     confirmReminder() {
       this.stopRepeat()
@@ -300,9 +624,10 @@ export default {
     },
     testSpeak() {
       uni.vibrateLong()
-      speak(this.reminderContent || '语音播报测试')
+      speak(this.remindContent || '语音播报测试')
       this.lastSpeakText = '手动测试 ' + this.nowText()
     },
+
     // ---------- 方案B：Android 息屏持续播报（前台服务保活） ----------
     setupKeepAlive() {
       // #ifdef APP-ANDROID
@@ -330,15 +655,20 @@ export default {
     syncKeepAlive() {
       // #ifdef APP-ANDROID
       if (!this.keepAliveSupported) return
-      const config = {
-        enabled: this.reminderEnabled,
-        time: this.reminderTime || '08:00',
-        content: this.reminderContent || ''
+      const cfg = {
+        enabled: this.slaveEnabled,
+        reminders: (this.slaveReminders || []).map((r) => ({
+          id: r.id,
+          enabled: r.enabled,
+          times: r.times || [],
+          content: r.content || ''
+        }))
       }
+      const json = JSON.stringify(cfg)
       try {
-        let ok = updateReminder(config)
+        let ok = updateReminder(json)
         if (!ok) {
-          ok = startKeepAlive(config)
+          ok = startKeepAlive(json)
         }
         this.keepAliveActive = !!ok
       } catch (e) {
@@ -415,7 +745,7 @@ export default {
       console.error(err)
       uni.showModal({
         title: '云同步不可用',
-        content: '请确认：1. HBuilderX 已登录 DCloud 账号；2. 已关联云服务空间；3. set-config、get-config、register-device、confirm-sync 四个云函数已上传部署；4. 已开通 uni-push 并重新打包。',
+        content: '请确认：1. HBuilderX 已登录 DCloud 账号；2. 已关联云服务空间；3. set-config、get-config、register-device 三个云函数已上传部署；4. 已开通 uni-push 并重新打包。',
         showCancel: false
       })
     },
@@ -441,6 +771,12 @@ export default {
   background-color: #f5f6fa;
   min-height: 100vh;
   box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+}
+.card-center {
+  margin-top: auto;
+  margin-bottom: auto;
 }
 .card {
   background: #ffffff;
@@ -504,6 +840,10 @@ export default {
 .state-off {
   color: #999999;
 }
+.state-warn {
+  color: #ff9900;
+  font-weight: bold;
+}
 .time-value {
   font-size: 34rpx;
   color: #007aff;
@@ -530,6 +870,74 @@ export default {
   font-size: 24rpx;
   color: #999999;
   line-height: 1.6;
+}
+.reminder-item {
+  margin-top: 24rpx;
+  padding: 24rpx;
+  background: #f9f9fb;
+  border-radius: 16rpx;
+}
+.records-block {
+  margin-top: 16rpx;
+  padding: 16rpx;
+  background: #ffffff;
+  border: 1rpx solid #ececec;
+  border-radius: 12rpx;
+  max-height: 320rpx;
+  overflow-y: auto;
+}
+.record-tip {
+  font-size: 22rpx;
+  color: #999999;
+  display: block;
+  margin-bottom: 8rpx;
+}
+.record-item {
+  display: flex;
+  flex-direction: column;
+  padding: 10rpx 0;
+  border-bottom: 1rpx solid #f2f2f2;
+}
+.record-item:last-child {
+  border-bottom: none;
+}
+.record-time {
+  font-size: 22rpx;
+  color: #999999;
+}
+.record-content {
+  font-size: 26rpx;
+  color: #333333;
+  margin-top: 4rpx;
+}
+.times-block {
+  margin-top: 24rpx;
+  padding-top: 24rpx;
+  border-top: 1rpx solid #f0f0f0;
+}
+.times-list {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 16rpx;
+  margin-top: 16rpx;
+}
+.time-chip {
+  display: flex;
+  align-items: center;
+  background: #ffffff;
+  border: 1rpx solid #e5e5e5;
+  border-radius: 12rpx;
+  padding: 8rpx 16rpx;
+}
+.time-del {
+  margin-left: 12rpx;
+  color: #e64340;
+  font-size: 34rpx;
+  line-height: 1;
+}
+.time-add {
+  margin: 0;
 }
 .mask {
   position: fixed;

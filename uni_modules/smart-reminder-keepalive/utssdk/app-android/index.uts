@@ -2,21 +2,24 @@
  * 智能提醒保活插件（仅 Android）
  * 方案B：前台服务 + 精确闹钟，息屏/后台也能自动持续语音播报。
  * 前端（uni-app 页面）通过条件编译仅在 APP-ANDROID 下 import 本插件。
+ *
+ * configJson 格式（多提醒）：
+ * {
+ *   "enabled": true,
+ *   "reminders": [
+ *     {"id":"r1","enabled":true,"times":["08:00","20:00"],"content":"喝水"}
+ *   ]
+ * }
  */
-type ReminderConfig = {
-  enabled: boolean
-  time: string
-  content: string
-}
 
-/** 启动保活前台服务并设置提醒（首次使用） */
-export function startKeepAlive(config: ReminderConfig): boolean {
-  return SmartReminderKeepalive.start(config.enabled, config.time, config.content)
+/** 启动保活前台服务并设置提醒（首次使用）；configJson 为多提醒配置 JSON 字符串 */
+export function startKeepAlive(configJson: string): boolean {
+  return SmartReminderKeepalive.start(configJson)
 }
 
 /** 更新提醒配置（服务不中断；配置未变化时不打断正在进行的播报） */
-export function updateReminder(config: ReminderConfig): boolean {
-  return SmartReminderKeepalive.update(config.enabled, config.time, config.content)
+export function updateReminder(configJson: string): boolean {
+  return SmartReminderKeepalive.update(configJson)
 }
 
 /** 停止当前播报（用户点击“确认已收到”），保活服务继续运行 */
@@ -37,6 +40,16 @@ export function isSpeaking(): boolean {
 /** 当前状态：idle | speaking | stopped */
 export function getState(): string {
   return SmartReminderKeepalive.getState()
+}
+
+/** 读取本地待上传的提醒记录（JSON 数组字符串，不清理） */
+export function getPendingRecords(): string {
+  return SmartReminderKeepalive.getPendingRecords()
+}
+
+/** 清空本地待上传的提醒记录（仅在成功上传后调用） */
+export function clearPendingRecords(): void {
+  SmartReminderKeepalive.clearPendingRecords()
 }
 
 /** 监听状态变化：'speaking'（开始播报）/ 'stopped'（已确认停止） */

@@ -19,17 +19,35 @@ import android.os.PowerManager
 import android.speech.tts.TextToSpeech
 import android.widget.Toast
 import io.dcloud.uts.UTSAndroid
+import org.json.JSONArray
+import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
 import java.util.Locale
 
+// 单条提醒：id 唯一，times 为每天多个触发时间
+data class Reminder(
+    val id: String,
+    val enabled: Boolean,
+    val times: List<String>,
+    val content: String
+)
+
 /**
- * 方案B：Android 前台服务保活
+ * 方案B：Android 前台服务保活（多提醒版）
  * 由 index.uts 调用，负责：
  * 1. 启动常驻前台服务（带常驻通知），降低进程被系统杀掉的概率
- * 2. 用精确闹钟在提醒时间唤醒 CPU（息屏/后台也能触发）
+ * 2. 用精确闹钟在【每一个提醒时间】唤醒 CPU（息屏/后台也能触发）
  * 3. 到点后由服务内原生 TextToSpeech 持续播报，每 10 秒一次，直到用户确认
+ *
+ * 配置格式（configJson）：
+ * {
+ *   "enabled": true,
+ *   "reminders": [
+ *     {"id":"r1","enabled":true,"times":["08:00","20:00"],"content":"喝水"}
+ *   ]
+ * }
  */
 object SmartReminderKeepalive {
 
@@ -39,7 +57,8 @@ object SmartReminderKeepalive {
     const val ACTION_STOP_SPEECH = "uts.sdk.modules.smartReminderKeepalive.STOP_SPEECH"
     const val ACTION_STOP_ALL = "uts.sdk.modules.smartReminderKeepalive.STOP_ALL"
 
-    const val EXTRA_ENABLED = "enabled"
+    const val EXTRA_CONFIG = "config"
+    const val EXTRA_FIRE_SLOT = "fire_slot"
     const val EXTRA_TIME = "time"
     const val EXTRA_CONTENT = "content"
 
@@ -47,11 +66,15 @@ object SmartReminderKeepalive {
     const val NOTIFICATION_ID = 1001
     const val ACTION_RESTART = "uts.sdk.modules.smartReminderKeepalive.RESTART"
 
-    private const val PREFS_NAME = "smart_reminder_keepalive"
+    // 供 Service 层读取的常量（公开）
+    const val PREFS_NAME = "smart_reminder_keepalive"
+    const val PREFS_SCHEDULED_CODES = "scheduled_codes"
+    private const val PREFS_PENDING_RECORDS = "pending_records"
+    private const val PENDING_MAX = 200
+
     private const val PREFS_HAS_CONFIG = "has_config"
-    private const val PREFS_ENABLED = "enabled"
-    private const val PREFS_TIME = "time"
-    private const val PREFS_CONTENT = "content"
+    private const val PREFS_MASTER_ENABLED = "master_enabled"
+    private const val PREFS_REMINDERS = "reminders"
 
     // 当前状态：idle | speaking | stopped
     @Volatile
@@ -61,21 +84,27 @@ object SmartReminderKeepalive {
     @Volatile
     var speaking: Boolean = false
 
-    // 最近一次触发提醒的日期（yyyy-MM-dd），保证同一天只触发一次
+    // 总开关
     @Volatile
-    var lastFiredDate: String = ""
+    var masterEnabled: Boolean = false
 
-    // 当前配置（进程被系统重建后仍可恢复）
+    // 当前配置原文（用于比较是否变化）
     @Volatile
-    var enabled: Boolean = false
+    var remindersJson: String = "[]"
 
+    // 解析后的提醒列表
     @Volatile
-    var time: String = ""
+    var remindersList: List<Reminder> = emptyList()
 
+    // 当前正在播报的内容
     @Volatile
-    var content: String = ""
+    var currentContent: String = "该做正事啦"
 
-    // 状态变化回调（由 index.uts 注册，通知 JS 侧“开始播报/已确认停止”）
+    // 已触发过的“槽位”（slotKey -> yyyy-MM-dd），防止同一天重复播报
+    @Volatile
+    var firedSlots: MutableMap<String, String> = HashMap()
+
+    // 状态变化回调（由 index.uts 注册）
     @Volatile
     var stateChangeCallback: ((String) -> Unit)? = null
 
@@ -96,33 +125,60 @@ object SmartReminderKeepalive {
         }
     }
 
-    /** 启动保活服务并写入提醒配置 */
-    fun start(enabledParam: Boolean, timeParam: String, contentParam: String): Boolean {
-        enabled = enabledParam
-        time = timeParam
-        content = contentParam
+    /** 从 JSON 解析配置 */
+    fun setConfigFromJson(json: String, resetSlots: Boolean = true) {
+        try {
+            val root = JSONObject(json)
+            masterEnabled = root.optBoolean("enabled", false)
+            remindersJson = json
+            val arr = root.optJSONArray("reminders") ?: JSONArray()
+            val list = ArrayList<Reminder>()
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                val enabled = o.optBoolean("enabled", false)
+                val times = ArrayList<String>()
+                val tArr = o.optJSONArray("times") ?: JSONArray()
+                for (j in 0 until tArr.length()) {
+                    val t = tArr.optString(j, "")
+                    if (t.isNotBlank()) times.add(t)
+                }
+                if (times.isEmpty()) continue
+                list.add(
+                    Reminder(
+                        id = o.optString("id", "r" + i),
+                        enabled = enabled,
+                        times = times,
+                        content = o.optString("content", "")
+                    )
+                )
+            }
+            remindersList = list
+            val first = list.firstOrNull { it.enabled }
+            currentContent = first?.content?.ifBlank { "该做正事啦" } ?: "该做正事啦"
+            if (resetSlots) firedSlots = HashMap()
+        } catch (e: Exception) {
+            e.printStackTrace()
+            masterEnabled = false
+            remindersJson = "[]"
+            remindersList = emptyList()
+        }
+    }
+
+    /** 启动保活服务并写入提醒配置（configJson 为多提醒 JSON 字符串） */
+    fun start(configJson: String): Boolean {
         val context = UTSAndroid.getAppContext() ?: return false
         val intent = Intent(context, SmartReminderService::class.java)
             .setAction(ACTION_START)
-            .putExtra(EXTRA_ENABLED, enabled)
-            .putExtra(EXTRA_TIME, time)
-            .putExtra(EXTRA_CONTENT, content)
-        saveConfig(context)
+            .putExtra(EXTRA_CONFIG, configJson)
         return startServiceCompat(context, intent)
     }
 
-    /** 更新提醒配置（服务不中断） */
-    fun update(enabledParam: Boolean, timeParam: String, contentParam: String): Boolean {
-        enabled = enabledParam
-        time = timeParam
-        content = contentParam
+    /** 更新提醒配置（服务不中断；配置未变化时不打断正在进行的播报） */
+    fun update(configJson: String): Boolean {
         val context = UTSAndroid.getAppContext() ?: return false
         val intent = Intent(context, SmartReminderService::class.java)
             .setAction(ACTION_UPDATE)
-            .putExtra(EXTRA_ENABLED, enabled)
-            .putExtra(EXTRA_TIME, time)
-            .putExtra(EXTRA_CONTENT, content)
-        saveConfig(context)
+            .putExtra(EXTRA_CONFIG, configJson)
         return startServiceCompat(context, intent)
     }
 
@@ -145,15 +201,62 @@ object SmartReminderKeepalive {
 
     fun getState(): String = currentState
 
+    /** 记录一次“开始播报”，写入本地待上传队列（进程被杀后 JS 下次上线再补传） */
+    fun appendPendingRecord(context: Context, reminderId: String, content: String, timeMillis: Long) {
+        try {
+            val sp = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val arr = JSONArray(sp.getString(PREFS_PENDING_RECORDS, "[]") ?: "[]")
+            val o = JSONObject()
+            o.put("reminderId", reminderId)
+            o.put("content", content)
+            o.put("time", timeMillis)
+            arr.put(o)
+            val capped = JSONArray()
+            val count = if (arr.length() > PENDING_MAX) PENDING_MAX else arr.length()
+            for (i in 0 until count) {
+                capped.put(arr.getJSONObject(i))
+            }
+            // 同步写盘：确保进程被立即杀掉时记录也已落盘（覆盖“进程被杀”场景）
+            sp.edit().putString(PREFS_PENDING_RECORDS, capped.toString()).commit()
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+    /** 读取本地待上传记录（不清空） */
+    fun getPendingRecords(): String {
+        val context = UTSAndroid.getAppContext() ?: return "[]"
+        return getPendingRecords(context)
+    }
+
+    fun getPendingRecords(context: Context): String {
+        val sp = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        return sp.getString(PREFS_PENDING_RECORDS, "[]") ?: "[]"
+    }
+
+    /** 清空本地待上传记录（仅在成功上传后调用） */
+    fun clearPendingRecords() {
+        val context = UTSAndroid.getAppContext() ?: return
+        clearPendingRecords(context)
+    }
+
+    fun clearPendingRecords(context: Context) {
+        try {
+            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit().remove(PREFS_PENDING_RECORDS).apply()
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
     /** 把当前配置写入本地（进程被杀/开机后仍可恢复） */
     fun saveConfig(context: Context) {
         try {
             val sp = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             sp.edit()
                 .putBoolean(PREFS_HAS_CONFIG, true)
-                .putBoolean(PREFS_ENABLED, enabled)
-                .putString(PREFS_TIME, time)
-                .putString(PREFS_CONTENT, content)
+                .putBoolean(PREFS_MASTER_ENABLED, masterEnabled)
+                .putString(PREFS_REMINDERS, remindersJson)
                 .apply()
         } catch (e: Exception) {
             e.printStackTrace()
@@ -167,9 +270,9 @@ object SmartReminderKeepalive {
             if (!sp.getBoolean(PREFS_HAS_CONFIG, false)) {
                 return false
             }
-            enabled = sp.getBoolean(PREFS_ENABLED, false)
-            time = sp.getString(PREFS_TIME, "") ?: ""
-            content = sp.getString(PREFS_CONTENT, "") ?: ""
+            masterEnabled = sp.getBoolean(PREFS_MASTER_ENABLED, false)
+            remindersJson = sp.getString(PREFS_REMINDERS, "[]") ?: "[]"
+            setConfigFromJson(remindersJson, resetSlots = false)
             true
         } catch (e: Exception) {
             e.printStackTrace()
@@ -201,16 +304,16 @@ object SmartReminderKeepalive {
     }
 }
 
-/**
- * 常驻前台服务：持有常驻通知、调度闹钟、触发原生 TTS 持续播报
- */
 class SmartReminderService : Service() {
 
-    private val handler = Handler(Looper.getMainLooper())
     private var tts: TextToSpeech? = null
-    private var ttsReady = false
+    private var ttsReady: Boolean = false
     private var speechRepeat: Runnable? = null
     private var wakeLock: PowerManager.WakeLock? = null
+    private val handler = Handler(Looper.getMainLooper())
+
+    // 已排入闹钟的 requestCode（用于取消/更新）
+    private val scheduledRequestCodes = mutableSetOf<Int>()
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -224,54 +327,45 @@ class SmartReminderService : Service() {
             SmartReminderKeepalive.ACTION_START,
             SmartReminderKeepalive.ACTION_UPDATE -> {
                 if (intent != null) {
-                    val newEnabled = intent.getBooleanExtra(
-                        SmartReminderKeepalive.EXTRA_ENABLED,
-                        SmartReminderKeepalive.enabled
-                    )
-                    val newTime = intent.getStringExtra(SmartReminderKeepalive.EXTRA_TIME)
-                        ?: SmartReminderKeepalive.time
-                    val newContent = intent.getStringExtra(SmartReminderKeepalive.EXTRA_CONTENT)
-                        ?: SmartReminderKeepalive.content
-                    val changed = newEnabled != SmartReminderKeepalive.enabled ||
-                        newTime != SmartReminderKeepalive.time ||
-                        newContent != SmartReminderKeepalive.content
-                    SmartReminderKeepalive.enabled = newEnabled
-                    SmartReminderKeepalive.time = newTime
-                    SmartReminderKeepalive.content = newContent
+                    val newJson = intent.getStringExtra(SmartReminderKeepalive.EXTRA_CONFIG)
+                        ?: SmartReminderKeepalive.remindersJson
+                    val changed = newJson != SmartReminderKeepalive.remindersJson
+                    SmartReminderKeepalive.setConfigFromJson(newJson, resetSlots = true)
+                    SmartReminderKeepalive.saveConfig(applicationContext)
                     // 配置真正变化时才停止当前播报；重复同步不打断
-                    if (changed) {
+                    if (changed && SmartReminderKeepalive.speaking) {
                         stopSpeechInternal(emitStopped = true)
                     }
                 }
                 startForegroundCompat()
                 updateNotificationText()
-                scheduleNextFire()
+                scheduleAllAlarms()
             }
-            SmartReminderKeepalive.ACTION_FIRE -> fire()
+            SmartReminderKeepalive.ACTION_FIRE -> fire(intent)
             SmartReminderKeepalive.ACTION_RESTART -> {
-                // 开机自启 / 划掉后自动复活：恢复持久化配置，重新进入前台并调度闹钟（不立即播报）
+                // 开机自启 / 划掉后自动复活：恢复持久化配置，重新进入前台并调度全部闹钟（不立即播报）
                 SmartReminderKeepalive.loadConfig(applicationContext)
                 startForegroundCompat()
                 updateNotificationText()
-                scheduleNextFire()
+                scheduleAllAlarms()
             }
             SmartReminderKeepalive.ACTION_STOP_SPEECH -> {
                 stopSpeechInternal(emitStopped = true)
-                scheduleNextFire()
+                scheduleAllAlarms()
             }
             SmartReminderKeepalive.ACTION_STOP_ALL -> {
                 stopSpeechInternal(emitStopped = true)
-                cancelAlarm()
+                cancelAllAlarms()
                 stopForegroundCompat()
                 stopSelf()
                 return START_NOT_STICKY
             }
             null -> {
-                // 进程被系统重建后恢复：读取持久化配置，重新进入前台并恢复闹钟
+                // 进程被系统重建后恢复：读取持久化配置，重新进入前台并恢复全部闹钟
                 SmartReminderKeepalive.loadConfig(applicationContext)
                 startForegroundCompat()
                 updateNotificationText()
-                scheduleNextFire()
+                scheduleAllAlarms()
             }
         }
         return START_STICKY
@@ -292,7 +386,7 @@ class SmartReminderService : Service() {
         // 用户从最近任务划掉应用：先保存配置，再安排一个几秒后的“闹钟”尝试自动复活（尽力而为）
         try {
             SmartReminderKeepalive.saveConfig(applicationContext)
-            if (!SmartReminderKeepalive.enabled) return
+            if (!SmartReminderKeepalive.masterEnabled) return
             val now = System.currentTimeMillis()
             if (now - lastTaskRemovedAt < 30_000L) {
                 // 30 秒内连续被清 2 次则放弃，避免被系统判定为恶意自启
@@ -398,33 +492,57 @@ class SmartReminderService : Service() {
     }
 
     private fun currentSummary(): String {
-        return if (!SmartReminderKeepalive.enabled) {
+        return if (!SmartReminderKeepalive.masterEnabled) {
             "今日提醒已关闭"
         } else {
-            val t = SmartReminderKeepalive.time.ifBlank { "08:00" }
-            val c = SmartReminderKeepalive.content.ifBlank { "智能提醒" }
-            "每天 $t：$c"
+            val enabledList = SmartReminderKeepalive.remindersList.filter { it.enabled }
+            val times = enabledList.flatMap { it.times }
+            if (enabledList.isEmpty()) "暂无提醒" else "共 ${enabledList.size} 条提醒 · 每日 ${times.size} 次"
         }
     }
 
-    // ---------- 闹钟调度 ----------
+    // ---------- 闹钟调度（多提醒） ----------
 
-    private fun scheduleNextFire() {
-        cancelAlarm()
-        if (!SmartReminderKeepalive.enabled) return
-        val parts = SmartReminderKeepalive.time.split(":")
-        if (parts.size < 2) return
-        val hour = parts[0].toIntOrNull() ?: return
-        val minute = parts[1].toIntOrNull() ?: return
-        val triggerAt = nextTriggerMillis(hour, minute)
+    private fun scheduleAllAlarms() {
+        cancelAllAlarms()
+        if (!SmartReminderKeepalive.masterEnabled) return
+        for (r in SmartReminderKeepalive.remindersList) {
+            if (!r.enabled) continue
+            for (t in r.times) {
+                val parts = t.split(":")
+                if (parts.size < 2) continue
+                val hour = parts[0].toIntOrNull() ?: continue
+                val minute = parts[1].toIntOrNull() ?: continue
+                if (hour > 23 || minute > 59) continue
+                val slotKey = r.id + "@" + t
+                val requestCode = slotKey.hashCode()
+                val triggerAt = nextTriggerMillis(hour, minute)
+                scheduleAlarm(requestCode, triggerAt, r.content, slotKey, t)
+                scheduledRequestCodes.add(requestCode)
+            }
+        }
+        persistScheduledCodes()
+    }
+
+    private fun scheduleAlarm(
+        requestCode: Int,
+        triggerAt: Long,
+        content: String,
+        slotKey: String,
+        time: String
+    ) {
         val alarmManager = getSystemService(Context.ALARM_SERVICE) as AlarmManager
         val fireIntent = Intent(this, ReminderReceiver::class.java)
+            .setAction(SmartReminderKeepalive.ACTION_FIRE)
+            .putExtra(SmartReminderKeepalive.EXTRA_FIRE_SLOT, slotKey)
+            .putExtra(SmartReminderKeepalive.EXTRA_TIME, time)
+            .putExtra(SmartReminderKeepalive.EXTRA_CONTENT, content)
         val flags = if (Build.VERSION.SDK_INT >= 23) {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         } else {
             PendingIntent.FLAG_UPDATE_CURRENT
         }
-        val pi = PendingIntent.getBroadcast(this, 0, fireIntent, flags)
+        val pi = PendingIntent.getBroadcast(this, requestCode, fireIntent, flags)
         try {
             when {
                 Build.VERSION.SDK_INT >= 31 && alarmManager.canScheduleExactAlarms() -> {
@@ -449,6 +567,19 @@ class SmartReminderService : Service() {
         }
     }
 
+    private fun rescheduleSlot(slotKey: String, content: String, time: String) {
+        val parts = time.split(":")
+        if (parts.size < 2) return
+        val hour = parts[0].toIntOrNull() ?: return
+        val minute = parts[1].toIntOrNull() ?: return
+        val requestCode = slotKey.hashCode()
+        scheduleAlarm(requestCode, nextTriggerMillis(hour, minute), content, slotKey, time)
+        if (!scheduledRequestCodes.contains(requestCode)) {
+            scheduledRequestCodes.add(requestCode)
+            persistScheduledCodes()
+        }
+    }
+
     private fun nextTriggerMillis(hour: Int, minute: Int): Long {
         val cal = Calendar.getInstance().apply {
             set(Calendar.HOUR_OF_DAY, hour)
@@ -462,17 +593,48 @@ class SmartReminderService : Service() {
         return cal.timeInMillis
     }
 
-    private fun cancelAlarm() {
+    private fun cancelAlarmRequest(requestCode: Int) {
         try {
             val alarmManager = getSystemService(Context.ALARM_SERVICE) as AlarmManager
             val fireIntent = Intent(this, ReminderReceiver::class.java)
+                .setAction(SmartReminderKeepalive.ACTION_FIRE)
             val flags = if (Build.VERSION.SDK_INT >= 23) {
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
             } else {
                 PendingIntent.FLAG_UPDATE_CURRENT
             }
-            val pi = PendingIntent.getBroadcast(this, 0, fireIntent, flags)
+            val pi = PendingIntent.getBroadcast(this, requestCode, fireIntent, flags)
             alarmManager.cancel(pi)
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+    private fun cancelAllAlarms() {
+        val codes = LinkedHashSet<Int>()
+        codes.addAll(scheduledRequestCodes)
+        // 读取上次持久化的闹钟 code，覆盖进程被重建的情况
+        try {
+            val sp = getSharedPreferences(SmartReminderKeepalive.PREFS_NAME, Context.MODE_PRIVATE)
+            val stored = sp.getString(SmartReminderKeepalive.PREFS_SCHEDULED_CODES, "") ?: ""
+            for (s in stored.split(",")) {
+                s.trim().toIntOrNull()?.let { codes.add(it) }
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+        for (code in codes) {
+            cancelAlarmRequest(code)
+        }
+        scheduledRequestCodes.clear()
+    }
+
+    private fun persistScheduledCodes() {
+        try {
+            val sp = getSharedPreferences(SmartReminderKeepalive.PREFS_NAME, Context.MODE_PRIVATE)
+            sp.edit()
+                .putString(SmartReminderKeepalive.PREFS_SCHEDULED_CODES, scheduledRequestCodes.joinToString(","))
+                .apply()
         } catch (e: Exception) {
             e.printStackTrace()
         }
@@ -480,17 +642,34 @@ class SmartReminderService : Service() {
 
     // ---------- 触发播报 ----------
 
-    private fun fire() {
-        if (!SmartReminderKeepalive.enabled) return
+    private fun fire(intent: Intent?) {
+        if (!SmartReminderKeepalive.masterEnabled) return
+        val slotKey = intent?.getStringExtra(SmartReminderKeepalive.EXTRA_FIRE_SLOT) ?: ""
+        val time = intent?.getStringExtra(SmartReminderKeepalive.EXTRA_TIME) ?: ""
+        val content = intent?.getStringExtra(SmartReminderKeepalive.EXTRA_CONTENT) ?: ""
         val today = SimpleDateFormat("yyyy-MM-dd", Locale.CHINA).format(Date())
-        // 同一天只触发一次（已确认过则不再重复触发）
-        if (SmartReminderKeepalive.lastFiredDate == today && !SmartReminderKeepalive.speaking) {
+        val firedDate = SmartReminderKeepalive.firedSlots[slotKey]
+        if (slotKey.isNotEmpty() && firedDate == today) {
+            // 今天该槽位已触发过：只续排次日，不重复播报
+            if (time.isNotBlank()) rescheduleSlot(slotKey, content, time)
             return
         }
-        SmartReminderKeepalive.lastFiredDate = today
+        if (slotKey.isNotEmpty()) {
+            SmartReminderKeepalive.firedSlots[slotKey] = today
+        }
+        SmartReminderKeepalive.currentContent = content.ifBlank { "该做正事啦" }
+        if (SmartReminderKeepalive.speaking) {
+            // 正在播报则不再打断；只续排
+            if (time.isNotBlank()) rescheduleSlot(slotKey, content, time)
+            return
+        }
+        // 开始播报：写入本地待上传队列，由 JS 侧下次活络时批量补传
+        val reminderId = slotKey.substringBefore('@')
+        if (reminderId.isNotBlank()) {
+            SmartReminderKeepalive.appendPendingRecord(applicationContext, reminderId, content, System.currentTimeMillis())
+        }
         startSpeech()
-        // 顺手安排第二天的闹钟
-        scheduleNextFire()
+        if (time.isNotBlank()) rescheduleSlot(slotKey, content, time)
     }
 
     private fun startSpeech() {
@@ -527,7 +706,7 @@ class SmartReminderService : Service() {
     private fun speakLoop() {
         val t = tts ?: return
         if (!ttsReady || !SmartReminderKeepalive.speaking) return
-        val text = SmartReminderKeepalive.content.ifBlank { "该做正事啦" }
+        val text = SmartReminderKeepalive.currentContent.ifBlank { "该做正事啦" }
         try {
             t.speak(text, TextToSpeech.QUEUE_FLUSH, null, "smart-reminder")
         } catch (e: Exception) {
@@ -592,6 +771,8 @@ class ReminderReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         val action = intent.action ?: return
         val serviceIntent = Intent(context, SmartReminderService::class.java).setAction(action)
+        // 保留触发所需的 extras
+        serviceIntent.putExtras(intent)
         try {
             if (Build.VERSION.SDK_INT >= 26) {
                 context.startForegroundService(serviceIntent)
@@ -612,7 +793,7 @@ class BootReceiver : BroadcastReceiver() {
         if (intent.action != Intent.ACTION_BOOT_COMPLETED) return
         try {
             if (!SmartReminderKeepalive.loadConfig(context)) return
-            if (!SmartReminderKeepalive.enabled) return
+            if (!SmartReminderKeepalive.masterEnabled) return
             val serviceIntent = Intent(context, SmartReminderService::class.java)
                 .setAction(SmartReminderKeepalive.ACTION_RESTART)
             if (Build.VERSION.SDK_INT >= 26) {

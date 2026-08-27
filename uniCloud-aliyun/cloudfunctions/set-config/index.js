@@ -5,24 +5,41 @@ const DOC_ID = 'main'
 // 注意：阿里云 uniCloud 不支持 createCollection，集合需在 uniCloud 网页控制台手动创建：
 //   reminder_config（主配置）、devices（从机注册）
 
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+const isValidTime = (t) => {
+  if (typeof t !== 'string' || !/^\d{2}:\d{2}$/.test(t)) return false
+  const h = Number(t.slice(0, 2))
+  const m = Number(t.slice(3, 5))
+  return h >= 0 && h <= 23 && m >= 0 && m <= 59
+}
 
 exports.main = async (event) => {
-  const enabled = event.enabled
-  const time = event.time
-  const content = event.content
-  if (typeof enabled !== 'boolean' || typeof time !== 'string' || !/^\d{2}:\d{2}$/.test(time)) {
-    return { code: 400, msg: '参数错误' }
+  const masterEnabled = event.masterEnabled === undefined ? true : !!event.masterEnabled
+  const reminders = event.reminders
+  if (!Array.isArray(reminders)) {
+    return { code: 400, msg: '参数错误：reminders 缺失' }
   }
 
-  // 每次保存生成新版本号，从机用它在 confirm-sync 中确认（ACK）
+  // 清洗并归一化为标准结构，剔除非法时间
+  const cleaned = []
+  for (const r of reminders) {
+    if (!r || typeof r !== 'object') continue
+    const times = Array.isArray(r.times) ? r.times.filter(isValidTime) : []
+    if (!times.length) continue
+    cleaned.push({
+      id: typeof r.id === 'string' && r.id ? r.id : 'r' + Math.random().toString(36).slice(2, 8),
+      enabled: r.enabled !== false,
+      times: Array.from(new Set(times)),
+      content: typeof r.content === 'string' ? r.content.slice(0, 200) : ''
+    })
+  }
+
+  // 每次保存生成新版本号，从机可据此判断是否需要更新
   const version = String(Date.now()) + '-' + Math.floor(Math.random() * 100000)
 
   try {
     await db.collection(COLLECTION).doc(DOC_ID).set({
-      enabled,
-      time,
-      content: typeof content === 'string' ? content : '',
+      masterEnabled,
+      reminders: cleaned,
       version,
       updatedAt: Date.now()
     })
@@ -58,41 +75,12 @@ exports.main = async (event) => {
     }
   }
 
-  const ackedOf = async (clientid) => {
-    try {
-      const res = await db.collection('devices').doc(clientid).get()
-      const doc = res.data && res.data.length ? res.data[0] : null
-      return !!doc && doc.ackVersion === version
-    } catch (e) {
-      return false
-    }
-  }
-
-  // 第一轮：推送所有从机
-  const waiting = []
+  // 方案1：写入 + 推送后立即返回，不做 ACK 等待/重传
+  // 从机在收到推送后自行拉取 get-config；若推送失败，则由启动/回前台同步与每日兜底最终补齐
   for (const d of clients) {
     const clientid = d._id
-    if (clientid && (await push(clientid))) {
-      waiting.push(clientid)
-    }
-  }
-
-  // 可靠传输：等待确认，未确认者重传一次（约 12 秒内完成，超时需在控制台调大）
-  const acked = []
-  await sleep(5000)
-  for (const clientid of waiting) {
-    if (await ackedOf(clientid)) {
-      acked.push(clientid)
-    } else {
+    if (clientid) {
       await push(clientid)
-    }
-  }
-  await sleep(5000)
-  for (const clientid of waiting) {
-    if (await ackedOf(clientid)) {
-      acked.push(clientid)
-    } else {
-      console.warn('从机未确认，将由启动/每日兜底同步补齐', clientid)
     }
   }
 
@@ -100,8 +88,6 @@ exports.main = async (event) => {
     code: 0,
     msg: 'ok',
     version,
-    slaveCount: clients.length,
-    ackedCount: [...new Set(acked)].length,
-    acked: [...new Set(acked)]
+    slaveCount: clients.length
   }
 }
