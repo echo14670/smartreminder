@@ -133,7 +133,10 @@ object SmartReminderKeepalive {
     fun setConfigFromJson(json: String, resetSlots: Boolean = true) {
         try {
             val root = JSONObject(json)
-            masterEnabled = root.optBoolean("enabled", false)
+            // 顶层 enabled 存在才覆盖，避免缺字段时把开关误置为 false
+            if (root.has("enabled")) {
+                masterEnabled = root.optBoolean("enabled", false)
+            }
             remindersJson = json
             val arr = root.optJSONArray("reminders") ?: JSONArray()
             val list = ArrayList<Reminder>()
@@ -196,7 +199,6 @@ object SmartReminderKeepalive {
     /** 完全停止保活服务（切换角色/不再需要时） */
     fun stopAll(): Boolean {
         val context = UTSAndroid.getAppContext() ?: return false
-        clearConfig(context)
         val intent = Intent(context, SmartReminderService::class.java).setAction(ACTION_STOP_ALL)
         return startServiceCompat(context, intent)
     }
@@ -264,7 +266,8 @@ object SmartReminderKeepalive {
                 .putBoolean(PREFS_HAS_CONFIG, true)
                 .putBoolean(PREFS_MASTER_ENABLED, masterEnabled)
                 .putString(PREFS_REMINDERS, remindersJson)
-                .apply()
+                // 用同步 commit 确保进程被杀前配置已落盘；apply() 是异步，可能来不及写盘导致自重启后配置丢失
+                .commit()
         } catch (e: Exception) {
             e.printStackTrace()
         }
@@ -284,15 +287,6 @@ object SmartReminderKeepalive {
         } catch (e: Exception) {
             e.printStackTrace()
             false
-        }
-    }
-
-    /** 清理本地配置（切换角色/不再需要保活时） */
-    fun clearConfig(context: Context) {
-        try {
-            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit().clear().apply()
-        } catch (e: Exception) {
-            e.printStackTrace()
         }
     }
 
@@ -329,6 +323,8 @@ class SmartReminderService : Service() {
     override fun onCreate() {
         super.onCreate()
         Log.i(TAG, "onCreate: 前台服务创建")
+        // 进程被闹钟/系统重建时，先恢复持久化配置，避免 FIRE 时静态 masterEnabled/reminders 为空导致后续调度/开关判断错乱
+        SmartReminderKeepalive.loadConfig(applicationContext)
         startForegroundCompat()
     }
 

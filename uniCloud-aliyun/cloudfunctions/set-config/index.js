@@ -62,7 +62,9 @@ exports.main = async (event) => {
 
   // uni-push 2.0：通过 uni-cloud-push 扩展库获取推送管理器。
   // 注意：不存在全局 uniPush，必须用 uniCloud.getPushManager({ appId }) 获取。
-  const appId = (event && event.clientInfo && event.clientInfo.appId) || '__UNI__00A13F1'
+  // 这里固定用 App(Android/iOS) 的 uniPush appid：从机都是 App 端注册的 clientid；
+  // 不要依赖 event.clientInfo.appId —— 小程序端调用时它可能变成微信小程序 appid，导致推送到安卓从机失败。
+  const appId = '__UNI__00A13F1'
   let uniPush = null
   try {
     uniPush = uniCloud.getPushManager({ appId })

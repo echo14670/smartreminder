@@ -3,3 +3,6 @@ unpackage/
 .hbuilderx/
 .DS_Store
 *.log
+# 微信开发者工具自动生成的本地配置（含测试 appid），勿提交
+project.config.json
+project.private.config.json

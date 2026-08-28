@@ -13,12 +13,13 @@
 - 提醒记录：从机每次**真正开始播报**都按提醒 id 记一条；原生保活时先写本地队列、下次活络再批量上传（覆盖进程被杀）；主机每条提醒可展开查看最近 30 条
 - 息屏自动播报（方案B，仅 Android）：原生前台服务 + 精确闹钟，App 在后台/息屏时也能到点自动持续语音播报
 - 语音：App 端直接调用手机系统 TTS（Android `TextToSpeech` / iOS `AVSpeechSynthesizer`）；H5/小程序端退化为 Toast 提示
+- 微信小程序（mp-weixin）：仅作主机设置提醒，从机入口已隐藏，需输入家庭邀请码校验通过后使用
 
 ## 部署步骤（一次性）
 
 1. HBuilderX 登录 DCloud 账号，获取 appid（manifest 可视化界面点“获取 appid”）
 2. 右键 `uniCloud-aliyun` -> 创建并关联阿里云服务空间（建议按量计费，见费用说明）
-3. 展开 `uniCloud-aliyun/cloudfunctions`，分别右键 `set-config`、`get-config`、`register-device`、`log-reminder`、`get-records` -> 上传部署
+3. 展开 `uniCloud-aliyun/cloudfunctions`，分别右键 `set-config`、`get-config`、`register-device`、`log-reminder`、`get-records`、`verify-invite` -> 上传部署。上传 `verify-invite` 后，到 uniCloud 网页控制台 -> 云函数 -> `verify-invite` -> 环境变量，新增 `FAMILY_INVITE_CODE`（= 你的家庭邀请码，建议足够长/随机）；未配置时小程序端将无法通过校验。
 4. 开通 uni-push：uniCloud 网页控制台（https://unicloud.dcloud.net.cn/）-> 推送设置 -> 开通（uni-push 2.0）；正式版运行会自动用到 `opendb-tempdata`、`opendb-device`、`uni-id-device` 三张 opendb 表，若控制台没有请手动创建。
 5. 超时：云控制台把 `set-config` 超时设为 60 秒（云函数内推送带 3 秒超时兜底，不会长时间占用）；`set-config/package.json` 已启用 `uni-cloud-push` 扩展库。
 6. 在 HBuilderX 中确认 manifest 的 `App模块配置 -> Push（消息推送）` 已勾选（uni-push 2.0），然后：
@@ -27,12 +28,21 @@
 7. **手动创建集合 `reminder_records`**：uniCloud 网页控制台 -> 云数据库 -> 新建集合，名称填 `reminder_records`（阿里云不支持云函数内自动建集合）
 8. 两台手机分别安装（一台设主机、一台设从机）
 
+## 微信小程序上架注意
+
+- 上传 `verify-invite` 云函数后，在 uniCloud 网页控制台 -> 云函数 -> `verify-invite` -> 环境变量，新增 `FAMILY_INVITE_CODE`（你的家庭邀请码，建议足够长/随机）；未配置时小程序端校验会失败。
+- 小程序端调用 uniCloud 需要把云端域名加入“服务器域名”白名单：微信公众平台 -> 开发设置 -> 服务器域名 -> request 合法域名，添加 uniCloud 域名（默认 `https://api.next.bspapp.com`，具体以 uniCloud 控制台/云函数 URL化 显示的为准）。manifest 里的 `urlCheck:false` 只对微信开发者工具生效，**不**影响线上，线上仍会强校验该域名。
+- 小程序端仅作“主机”使用（从机入口已隐藏），不涉及用户隐私采集类 API；提交审核前请在公众平台填写《用户隐私保护指引》。
+- 用微信开发者工具“上传”后，到公众平台“版本管理 -> 开发版本 -> 提交审核”。
+
 ## 开源 / 公共仓库注意事项
 
 - 仓库不含任何密钥、签名证书（如 `smartreminder.keystore`）或云服务空间 ID；`.hbuilderx/`、`unpackage/` 均已 gitignore。
-- `manifest.json` 中的 `__UNI__00A13F1` 是原作者在 DCloud 的 appid，**fork 后请替换成你自己的 appid**，并在 HBuilderX 里重新关联你自己的服务空间。
+- `manifest.json` 中的 `__UNI__00A13F1` 是本项目的 DCloud APPID（`mp-weixin` 里的 `wx4304cb812a03dda4` 是微信小程序的 appid）；若 fork 请替换成你自己的 appid，并在 HBuilderX 里重新关联你自己的服务空间。
 - 克隆后运行时**不会自动连接原作者的服务空间，也不会产生原作者的费用**：服务空间绑定存在本机 `.hbuilderx`/DCloud 账号，不在仓库里。你必须自己创建/关联服务空间、上传部署云函数、开通 uni-push，功能才会工作。
 - 从机列表只显示主机“开启”的提醒（关闭的隐藏）；从机页面与提醒弹窗已做适老化字号放大。
+- `project.config.json`、`project.private.config.json` 是微信开发者工具自动生成的本地配置（含测试 appid / 本地设置），已加入 `.gitignore`，请勿提交。
+- 微信小程序端家庭邀请码不写在仓库/客户端里，改为云端校验：邀请码配置在 `verify-invite` 云函数的环境变量 `FAMILY_INVITE_CODE` 中（uniCloud 网页控制台 -> 云函数 -> verify-invite -> 环境变量，建议用足够长/随机的值避免被暴力猜出）；未配置时云端默认拒绝所有校验。App 端不做此校验。
 
 ## 提醒记录（从机触发日志）
 
@@ -101,7 +111,7 @@
 - `utils/tts.js` 系统 TTS 语音播报工具（speak / stopSpeaking，前台兜底）
 - `uni_modules/smart-reminder-keepalive/` 方案B UTS 插件（仅 Android）
   - `utssdk/app-android/hybrid.kt` 原生前台服务：常驻通知、精确闹钟、原生 TTS 持续播报、唤醒锁
-  - `utssdk/app-android/index.uts` 插件导出 API（startKeepAlive / updateReminder / stopSpeech / stopKeepAlive / getState / onStateChanged）
+  - `utssdk/app-android/index.uts` 插件导出 API（startKeepAlive / updateReminder / stopSpeech / stopKeepAlive / getState / getSpeakContent / getPendingRecords / clearPendingRecords / onStateChanged）
   - `utssdk/app-android/AndroidManifest.xml` 前台服务与权限声明（自定义基座/云打包生效）
 - `uniCloud-aliyun/cloudfunctions/set-config` 写入配置 + 推送
 - `uniCloud-aliyun/cloudfunctions/get-config` 读取配置

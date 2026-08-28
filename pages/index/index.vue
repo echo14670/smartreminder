@@ -1,13 +1,28 @@
 <template>
   <view class="page">
+    <!-- #ifdef MP-WEIXIN -->
+    <view v-if="inviteLocked" class="card card-center">
+      <text class="page-title">家庭邀请</text>
+      <text class="desc">请输入家庭邀请码后使用</text>
+      <input class="input" v-model="inviteInput" placeholder="请输入邀请码" />
+      <button class="btn" type="primary" @click="verifyInvite">进入</button>
+      <text v-if="inviteError" class="tip" style="color:#e64340">{{ inviteError }}</text>
+    </view>
+    <!-- #endif -->
+
     <!-- 未选择角色 -->
-    <view v-if="!mode" class="card card-center">
+    <view v-if="!inviteLocked && !mode" class="card card-center">
       <button class="btn" type="primary" @click="chooseMode('host')">本机作为主机（设置提醒）</button>
+      <!-- #ifndef MP-WEIXIN -->
       <button class="btn" type="default" @click="chooseMode('slave')">本机作为从机（接收提醒）</button>
+      <!-- #endif -->
+      <!-- #ifdef MP-WEIXIN -->
+      <text class="desc">小程序仅支持“主机”设置，从机请在安卓 App 上使用</text>
+      <!-- #endif -->
     </view>
 
     <!-- 主机面板 -->
-    <view v-else-if="mode === 'host'" class="card">
+    <view v-else-if="!inviteLocked && mode === 'host'" class="card">
       <view class="header">
         <text class="page-title">主机</text>
         <text class="tag">本机：主机</text>
@@ -18,7 +33,7 @@
       </view>
       <view class="row">
         <text class="label">同步状态</text>
-        <text :class="syncStatus === '待同步' ? 'state-warn' : (syncStatus === '已同步' ? 'state-on' : 'muted')">{{ syncStatus }}</text>
+        <text :class="{ 'state-warn': syncStatus === '待同步', 'state-on': syncStatus === '已同步', muted: syncStatus !== '待同步' && syncStatus !== '已同步' }">{{ syncStatus }}</text>
       </view>
 
       <view v-for="(r, idx) in reminders" :key="r.id" class="reminder-item">
@@ -64,17 +79,17 @@
     </view>
 
     <!-- 从机面板 -->
-    <view v-else class="card slave-card">
+    <view v-else-if="!inviteLocked" class="card slave-card">
       <view class="header">
         <text class="page-title">从机</text>
         <text class="tag">本机：从机</text>
       </view>
-      <view class="row"><text class="label">今日提醒</text><text :class="slaveEnabled ? 'state-on' : 'state-off'">{{ slaveEnabled ? '开' : '关' }}</text></view>
+      <view class="row"><text class="label">今日提醒</text><text :class="{ 'state-on': slaveEnabled, 'state-off': !slaveEnabled }">{{ slaveEnabled ? '开' : '关' }}</text></view>
       <view class="row"><text class="label">提醒数量</text><text class="value">{{ visibleSlaveReminders.length }} 条 · 每日 {{ totalSlaveTimes }} 次</text></view>
       <view v-for="(r, idx) in visibleSlaveReminders" :key="r.id" class="reminder-item">
         <view class="row">
           <text class="label">{{ idx + 1 }}.{{ r.content || '（未填内容）' }}</text>
-          <text :class="r.enabled ? 'state-on' : 'state-off'">{{ r.enabled ? '开' : '关' }}</text>
+          <text :class="{ 'state-on': r.enabled, 'state-off': !r.enabled }">{{ r.enabled ? '开' : '关' }}</text>
         </view>
         <view class="row"><text class="label">时间</text><text class="value">{{ r.times.join('、') || '--' }}</text></view>
       </view>
@@ -125,7 +140,6 @@ const ENABLE_DAILY_FALLBACK = true
 // 仅在“重新回到前台”且即将到提醒时才同步，避免频繁打开 App 产生大量云函数调用
 const SYNC_NEAR_MINUTES = 15
 const SYNC_NEAR_COOLDOWN_MS = 5 * 60 * 1000
-
 function makeReminder() {
   return {
     id: 'r' + Date.now() + Math.floor(Math.random() * 1000),
@@ -163,7 +177,12 @@ export default {
       _notifRequested: false,
       // 同步节流
       _coldStart: true,
+      _hasServerConfig: false,
       _lastSyncAt: 0,
+      // 小程序(mp-weixin)家庭邀请码校验
+      inviteLocked: false,
+      inviteInput: '',
+      inviteError: '',
       // 提醒记录（主机展示）
       reminderRecords: {},
       recordExpanded: {},
@@ -198,7 +217,18 @@ export default {
     let plat = '?'
     try { plat = uni.getSystemInfoSync().platform || '?' } catch (e) {}
     console.log('[SMARTREMINDER] onLoad 执行，mode=' + uni.getStorageSync('role') + '，实际平台=' + plat)
+    // #ifdef MP-WEIXIN
+    // 小程序端先做家庭邀请码校验，验证通过后可用（App 端不受影响）
+    this.inviteLocked = !uni.getStorageSync('familyInviteOk')
+    // #endif
     this.mode = uni.getStorageSync('role') || ''
+    // #ifdef MP-WEIXIN
+    // 小程序端仅作主机：若历史存了“从机”角色则清掉，避免露出从机页
+    if (this.mode === 'slave') {
+      this.mode = ''
+      uni.removeStorageSync('role')
+    }
+    // #endif
     const config = uni.getStorageSync('hostConfig') || {}
     this.normalizeHostConfig(config)
     this.refreshSyncState()
@@ -250,6 +280,27 @@ export default {
     // #endif
   },
   methods: {
+    // 小程序(mp-weixin)端校验家庭邀请码（云端校验，邀请码在 verify-invite 云函数环境变量配置）
+    async verifyInvite() {
+      const code = String(this.inviteInput || '').trim()
+      if (!code) {
+        this.inviteError = '请输入邀请码'
+        return
+      }
+      this.inviteError = ''
+      try {
+        const res = await uniCloud.callFunction({ name: 'verify-invite', data: { code } })
+        const result = res && res.result
+        if (result && result.valid) {
+          uni.setStorageSync('familyInviteOk', 1)
+          this.inviteLocked = false
+        } else {
+          this.inviteError = (result && result.msg) || '邀请码不正确，请向家人确认'
+        }
+      } catch (e) {
+        this.inviteError = '校验失败，请检查网络或确认云端 verify-invite 已部署'
+      }
+    },
     // ---------- 角色 ----------
     chooseMode(mode) {
       this.mode = mode
@@ -455,13 +506,17 @@ export default {
       }).then((res) => {
         const data = res.result && res.result.data
         const cfg = this.normalizeServerConfig(data)
+        // 只有真的拿到云端配置才同步给原生保活服务；空/缺失配置不写 false，避免自重启后变成“关闭今日提醒”
+        this._hasServerConfig = !!data
         this.slaveEnabled = cfg.enabled
         this.slaveReminders = cfg.reminders
         this.lastSyncText = this.nowText()
         this._lastSyncAt = Date.now()
         this.scheduleDailySync()
         // #ifdef APP-PLUS
-        this.syncKeepAlive()
+        if (this._hasServerConfig) {
+          this.syncKeepAlive()
+        }
         this.flushPendingRecords()
         // #endif
         this.rescheduleNext()
@@ -808,7 +863,7 @@ export default {
       console.error(err)
       uni.showModal({
         title: '云同步不可用',
-        content: '请确认：1. HBuilderX 已登录 DCloud 账号；2. 已关联云服务空间；3. set-config、get-config、register-device 三个云函数已上传部署；4. 已开通 uni-push 并重新打包。',
+        content: '请确认：1. HBuilderX 已登录 DCloud 账号；2. 已关联云服务空间；3. set-config、get-config、register-device、log-reminder、get-records、verify-invite 云函数均已上传部署；4. 已开通 uni-push 并重新打包。',
         showCancel: false
       })
     },

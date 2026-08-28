@@ -2,8 +2,8 @@
     "name" : "智能提醒",
     "appid" : "__UNI__00A13F1",
     "description" : "智能提醒：双端联动语音提醒 App",
-    "versionName" : "1.0.0",
-    "versionCode" : 105,
+    "versionName" : "1.0.1",
+    "versionCode" : 109,
     "transformPx" : false,
     "vueVersion" : "3",
     "app-plus" : {
@@ -38,7 +38,7 @@
     },
     "quickapp" : {},
     "mp-weixin" : {
-        "appid" : "",
+        "appid" : "wx4304cb812a03dda4",
         "setting" : {
             "urlCheck" : false
         },
