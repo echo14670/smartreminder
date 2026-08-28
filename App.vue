@@ -6,7 +6,10 @@ export default {
     uni.getPushClientId({
       success: (res) => {
         const clientid = res.cid
+        const oldCid = uni.getStorageSync('pushCid')
         uni.setStorageSync('pushCid', clientid)
+        // cid 未变则不重复注册：避免调试反复运行 App 时每次都调 register-device 刷调用次数
+        if (oldCid === clientid) return
         uniCloud.callFunction({
           name: 'register-device',
           data: { clientid, role: uni.getStorageSync('role') || 'slave' }
@@ -16,7 +19,15 @@ export default {
     })
     // 收到“配置已更新”推送：从机立即重新同步
     uni.onPushMessage((res) => {
-      const payload = res && res.payload
+      // 兼容不同 uni-push 版本回调结构：payload 可能在 res.payload 或 res.data.payload
+      let payload = res && res.payload
+      if (!payload && res && res.data) {
+        try {
+          payload = typeof res.data === 'string' ? JSON.parse(res.data) : (res.data.payload || res.data)
+        } catch (e) {
+          payload = null
+        }
+      }
       if (res.type === 'receive' && payload && payload.type === 'config-updated') {
         uni.$emit('config-updated')
       }

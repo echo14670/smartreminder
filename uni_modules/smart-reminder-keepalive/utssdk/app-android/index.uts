@@ -42,6 +42,11 @@ export function getState(): string {
   return SmartReminderKeepalive.getState()
 }
 
+/** 当前正在播报（或最近一次播报）的内容 */
+export function getSpeakContent(): string {
+  return SmartReminderKeepalive.getSpeakContent()
+}
+
 /** 读取本地待上传的提醒记录（JSON 数组字符串，不清理） */
 export function getPendingRecords(): string {
   return SmartReminderKeepalive.getPendingRecords()

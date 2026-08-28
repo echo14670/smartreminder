@@ -60,14 +60,29 @@ exports.main = async (event) => {
     console.error('读取从机列表失败', e)
   }
 
+  // uni-push 2.0：通过 uni-cloud-push 扩展库获取推送管理器。
+  // 注意：不存在全局 uniPush，必须用 uniCloud.getPushManager({ appId }) 获取。
+  const appId = (event && event.clientInfo && event.clientInfo.appId) || '__UNI__00A13F1'
+  let uniPush = null
+  try {
+    uniPush = uniCloud.getPushManager({ appId })
+  } catch (e) {
+    console.error('初始化 uni-push 管理器失败 appId=' + appId, e)
+  }
+
   const push = async (clientid) => {
+    if (!uniPush || typeof uniPush.sendMessage !== 'function') return false
     try {
-      await uniPush.sendMessage({
-        push_clientid: clientid,
-        title: '智能提醒',
-        content: '主机更新了提醒设置',
-        payload: { type: 'config-updated', version }
-      })
+      // 3 秒超时兜底：即使 uni-push 未开通导致 sendMessage 长时间不返回，也只消耗最多 3 秒，避免单次计入几十分钟
+      await Promise.race([
+        uniPush.sendMessage({
+          push_clientid: clientid,
+          title: '智能提醒',
+          content: '主机更新了提醒设置',
+          payload: { type: 'config-updated', version }
+        }),
+        new Promise((resolve) => setTimeout(resolve, 3000))
+      ])
       return true
     } catch (e) {
       console.error('推送失败', clientid, e)
@@ -75,14 +90,8 @@ exports.main = async (event) => {
     }
   }
 
-  // 方案1：写入 + 推送后立即返回，不做 ACK 等待/重传
-  // 从机在收到推送后自行拉取 get-config；若推送失败，则由启动/回前台同步与每日兜底最终补齐
-  for (const d of clients) {
-    const clientid = d._id
-    if (clientid) {
-      await push(clientid)
-    }
-  }
+  // 并行推送 + 快速失败，不阻塞主流程；推送失败由启动/回前台同步与每日兜底最终补齐
+  await Promise.all(clients.filter((d) => d._id).map((d) => push(d._id)))
 
   return {
     code: 0,

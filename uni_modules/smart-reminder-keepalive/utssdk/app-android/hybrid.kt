@@ -9,6 +9,7 @@ import android.app.Service
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.SharedPreferences
 import android.content.pm.ServiceInfo
 import android.os.Build
@@ -18,6 +19,7 @@ import android.os.Looper
 import android.os.PowerManager
 import android.speech.tts.TextToSpeech
 import android.widget.Toast
+import android.util.Log
 import io.dcloud.uts.UTSAndroid
 import org.json.JSONArray
 import org.json.JSONObject
@@ -64,6 +66,8 @@ object SmartReminderKeepalive {
 
     const val CHANNEL_ID = "smart_reminder_keepalive"
     const val NOTIFICATION_ID = 1001
+    const val ALARM_CHANNEL_ID = "smart_reminder_alarm"
+    const val ALARM_NOTIFICATION_ID = 1002
     const val ACTION_RESTART = "uts.sdk.modules.smartReminderKeepalive.RESTART"
 
     // 供 Service 层读取的常量（公开）
@@ -201,6 +205,9 @@ object SmartReminderKeepalive {
 
     fun getState(): String = currentState
 
+    /** 当前正在播报（或最近一次播报）的内容 */
+    fun getSpeakContent(): String = currentContent
+
     /** 记录一次“开始播报”，写入本地待上传队列（进程被杀后 JS 下次上线再补传） */
     fun appendPendingRecord(context: Context, reminderId: String, content: String, timeMillis: Long) {
         try {
@@ -306,10 +313,12 @@ object SmartReminderKeepalive {
 
 class SmartReminderService : Service() {
 
+    private val TAG = "SmartReminder"
     private var tts: TextToSpeech? = null
     private var ttsReady: Boolean = false
     private var speechRepeat: Runnable? = null
     private var wakeLock: PowerManager.WakeLock? = null
+    private var screenOnReceiver: ScreenOnReceiver? = null
     private val handler = Handler(Looper.getMainLooper())
 
     // 已排入闹钟的 requestCode（用于取消/更新）
@@ -319,10 +328,12 @@ class SmartReminderService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        Log.i(TAG, "onCreate: 前台服务创建")
         startForegroundCompat()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        Log.i(TAG, "onStartCommand action=" + (intent?.action ?: "null"))
         when (intent?.action) {
             SmartReminderKeepalive.ACTION_START,
             SmartReminderKeepalive.ACTION_UPDATE -> {
@@ -419,16 +430,19 @@ class SmartReminderService : Service() {
     private fun startForegroundCompat() {
         val notification = buildNotification()
         try {
-            if (Build.VERSION.SDK_INT >= 29) {
+            if (Build.VERSION.SDK_INT >= 34) {
                 startForeground(
                     SmartReminderKeepalive.NOTIFICATION_ID,
                     notification,
                     ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
                 )
             } else {
+                // Android 14 以下没有 SPECIAL_USE 类型，用无类型重载避免抛异常
                 startForeground(SmartReminderKeepalive.NOTIFICATION_ID, notification)
             }
+            Log.i(TAG, "startForegroundCompat: 成功")
         } catch (e: Exception) {
+            Log.e(TAG, "startForegroundCompat: 失败 " + e.message)
             e.printStackTrace()
         }
     }
@@ -491,6 +505,59 @@ class SmartReminderService : Service() {
         }
     }
 
+    // 到点放一条高优先级全屏通知：息屏时点亮屏幕并拉起 App（闹钟/来电同款机制）
+    private fun showReminderNotification(content: String) {
+        try {
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            if (Build.VERSION.SDK_INT >= 26) {
+                val channel = NotificationChannel(
+                    SmartReminderKeepalive.ALARM_CHANNEL_ID,
+                    "提醒响铃",
+                    NotificationManager.IMPORTANCE_HIGH
+                )
+                channel.description = "到点提醒：息屏自动亮屏并拉起 App"
+                channel.setSound(null, null)
+                channel.enableVibration(false)
+                nm.createNotificationChannel(channel)
+            }
+            val builder = if (Build.VERSION.SDK_INT >= 26) {
+                Notification.Builder(this, SmartReminderKeepalive.ALARM_CHANNEL_ID)
+            } else {
+                @Suppress("DEPRECATION")
+                Notification.Builder(this)
+            }
+            builder.setSmallIcon(android.R.drawable.ic_dialog_info)
+                .setContentTitle("智能提醒")
+                .setContentText(content.ifBlank { "该做正事啦" })
+                .setAutoCancel(true)
+                .setPriority(Notification.PRIORITY_MAX)
+                .setCategory(Notification.CATEGORY_ALARM)
+                .setVisibility(Notification.VISIBILITY_PUBLIC)
+                .setDefaults(0)
+            val launchIntent = packageManager.getLaunchIntentForPackage(packageName)
+            if (launchIntent != null) {
+                launchIntent.addFlags(
+                    Intent.FLAG_ACTIVITY_NEW_TASK or
+                        Intent.FLAG_ACTIVITY_SINGLE_TOP or
+                        Intent.FLAG_ACTIVITY_CLEAR_TOP
+                )
+                val flags = if (Build.VERSION.SDK_INT >= 23) {
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                } else {
+                    PendingIntent.FLAG_UPDATE_CURRENT
+                }
+                val pi = PendingIntent.getActivity(this, 999, launchIntent, flags)
+                builder.setContentIntent(pi)
+                // 关键：息屏时全屏拉起 App（Android 10+ 需 USE_FULL_SCREEN_INTENT）
+                builder.setFullScreenIntent(pi, true)
+            }
+            nm.notify(SmartReminderKeepalive.ALARM_NOTIFICATION_ID, builder.build())
+            Log.i(TAG, "showReminderNotification: 已发送全屏提醒")
+        } catch (e: Exception) {
+            Log.e(TAG, "showReminderNotification 失败 " + e.message)
+        }
+    }
+
     private fun currentSummary(): String {
         return if (!SmartReminderKeepalive.masterEnabled) {
             "今日提醒已关闭"
@@ -506,6 +573,7 @@ class SmartReminderService : Service() {
     private fun scheduleAllAlarms() {
         cancelAllAlarms()
         if (!SmartReminderKeepalive.masterEnabled) return
+        var scheduled = 0
         for (r in SmartReminderKeepalive.remindersList) {
             if (!r.enabled) continue
             for (t in r.times) {
@@ -519,9 +587,11 @@ class SmartReminderService : Service() {
                 val triggerAt = nextTriggerMillis(hour, minute)
                 scheduleAlarm(requestCode, triggerAt, r.content, slotKey, t)
                 scheduledRequestCodes.add(requestCode)
+                scheduled++
             }
         }
         persistScheduledCodes()
+        Log.i(TAG, "scheduleAllAlarms: 已调度 " + scheduled + " 个提醒")
     }
 
     private fun scheduleAlarm(
@@ -545,11 +615,8 @@ class SmartReminderService : Service() {
         val pi = PendingIntent.getBroadcast(this, requestCode, fireIntent, flags)
         try {
             when {
-                Build.VERSION.SDK_INT >= 31 && alarmManager.canScheduleExactAlarms() -> {
-                    alarmManager.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, pi)
-                }
                 Build.VERSION.SDK_INT >= 23 -> {
-                    // 无精确闹钟权限时退化为“闹钟”类型（精确、免权限、可唤醒 Doze）
+                    // 统一用“闹钟”类型：精确、免 SCHEDULE_EXACT_ALARM 权限、可唤醒 Doze（息屏最可靠）
                     val alarmInfo = AlarmManager.AlarmClockInfo(triggerAt, null)
                     alarmManager.setAlarmClock(alarmInfo, pi)
                 }
@@ -647,10 +714,12 @@ class SmartReminderService : Service() {
         val slotKey = intent?.getStringExtra(SmartReminderKeepalive.EXTRA_FIRE_SLOT) ?: ""
         val time = intent?.getStringExtra(SmartReminderKeepalive.EXTRA_TIME) ?: ""
         val content = intent?.getStringExtra(SmartReminderKeepalive.EXTRA_CONTENT) ?: ""
+        Log.i(TAG, "fire: slot=" + slotKey + " speaking=" + SmartReminderKeepalive.speaking)
         val today = SimpleDateFormat("yyyy-MM-dd", Locale.CHINA).format(Date())
         val firedDate = SmartReminderKeepalive.firedSlots[slotKey]
         if (slotKey.isNotEmpty() && firedDate == today) {
             // 今天该槽位已触发过：只续排次日，不重复播报
+            Log.i(TAG, "fire: 今日已触发，跳过（只续排次日）")
             if (time.isNotBlank()) rescheduleSlot(slotKey, content, time)
             return
         }
@@ -660,6 +729,7 @@ class SmartReminderService : Service() {
         SmartReminderKeepalive.currentContent = content.ifBlank { "该做正事啦" }
         if (SmartReminderKeepalive.speaking) {
             // 正在播报则不再打断；只续排
+            Log.i(TAG, "fire: 正在播报，不打断（只续排）")
             if (time.isNotBlank()) rescheduleSlot(slotKey, content, time)
             return
         }
@@ -668,6 +738,8 @@ class SmartReminderService : Service() {
         if (reminderId.isNotBlank()) {
             SmartReminderKeepalive.appendPendingRecord(applicationContext, reminderId, content, System.currentTimeMillis())
         }
+        Log.i(TAG, "fire: 开始播报，reminderId=" + reminderId)
+        showReminderNotification(content) // 息屏自动亮屏 + 拉起 App
         startSpeech()
         if (time.isNotBlank()) rescheduleSlot(slotKey, content, time)
     }
@@ -675,7 +747,39 @@ class SmartReminderService : Service() {
     private fun startSpeech() {
         SmartReminderKeepalive.emitState("speaking")
         acquireWakeLock()
+        registerScreenOnReceiver()
         ensureTtsReady()
+    }
+
+    // 息屏触发播报期间，用户一解锁/亮屏就把 App 调到前台显示“确认已收到”
+    private fun registerScreenOnReceiver() {
+        if (screenOnReceiver != null) return
+        try {
+            val r = ScreenOnReceiver()
+            val filter = IntentFilter(Intent.ACTION_SCREEN_ON)
+            filter.addAction(Intent.ACTION_USER_PRESENT)
+            if (Build.VERSION.SDK_INT >= 33) {
+                registerReceiver(r, filter, Context.RECEIVER_EXPORTED)
+            } else {
+                registerReceiver(r, filter)
+            }
+            screenOnReceiver = r
+            Log.i(TAG, "registerScreenOnReceiver: 已注册（亮屏自动回前台）")
+        } catch (e: Exception) {
+            Log.e(TAG, "registerScreenOnReceiver 失败 " + e.message)
+        }
+    }
+
+    private fun unregisterScreenOnReceiver() {
+        try {
+            if (screenOnReceiver != null) {
+                unregisterReceiver(screenOnReceiver)
+                screenOnReceiver = null
+                Log.i(TAG, "unregisterScreenOnReceiver: 已注销")
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
     }
 
     private fun ensureTtsReady() {
@@ -685,6 +789,7 @@ class SmartReminderService : Service() {
         }
         if (tts == null) {
             tts = TextToSpeech(this, TextToSpeech.OnInitListener { status ->
+                Log.i(TAG, "TTS init status=" + status + " SUCCESS=" + TextToSpeech.SUCCESS)
                 if (status == TextToSpeech.SUCCESS) {
                     ttsReady = true
                     try {
@@ -696,6 +801,7 @@ class SmartReminderService : Service() {
                         speakLoop()
                     }
                 } else {
+                    Log.e(TAG, "TTS 语音引擎初始化失败 status=" + status)
                     Toast.makeText(this, "语音引擎初始化失败，无法播报", Toast.LENGTH_SHORT).show()
                     SmartReminderKeepalive.emitState("stopped")
                 }
@@ -719,7 +825,7 @@ class SmartReminderService : Service() {
             }
         }
         speechRepeat = runnable
-        handler.postDelayed(runnable, 10_000L)
+        handler.postDelayed(runnable, 3_000L)
     }
 
     private fun stopSpeechInternal(emitStopped: Boolean) {
@@ -732,6 +838,13 @@ class SmartReminderService : Service() {
             e.printStackTrace()
         }
         releaseWakeLock()
+        unregisterScreenOnReceiver()
+        try {
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            nm.cancel(SmartReminderKeepalive.ALARM_NOTIFICATION_ID)
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
         if (emitStopped) {
             SmartReminderKeepalive.emitState("stopped")
         }
@@ -762,6 +875,7 @@ class SmartReminderService : Service() {
             e.printStackTrace()
         }
     }
+
 }
 
 /**
@@ -778,6 +892,29 @@ class ReminderReceiver : BroadcastReceiver() {
                 context.startForegroundService(serviceIntent)
             } else {
                 context.startService(serviceIntent)
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+}
+
+/**
+ * 亮屏自动回到 App：息屏触发持续播报后，用户一解锁/亮屏就把 App 调到前台显示“确认已收到”
+ */
+class ScreenOnReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent) {
+        if (!SmartReminderKeepalive.speaking) return
+        try {
+            val launchIntent = context.packageManager.getLaunchIntentForPackage(context.packageName)
+            if (launchIntent != null) {
+                launchIntent.addFlags(
+                    Intent.FLAG_ACTIVITY_NEW_TASK or
+                        Intent.FLAG_ACTIVITY_SINGLE_TOP or
+                        Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
+                )
+                context.startActivity(launchIntent)
+                Log.i("SmartReminder", "ScreenOnReceiver: 已拉起 App 到前台")
             }
         } catch (e: Exception) {
             e.printStackTrace()

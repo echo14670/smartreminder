@@ -13,6 +13,8 @@
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <!-- 引导用户加入电池优化白名单（跳转系统设置页时使用） -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- Android 10+：息屏到点自动亮屏并拉起 App（全屏提醒） -->
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
     <application>
         <service
             android:name="uts.sdk.modules.smartReminderKeepalive.SmartReminderService"

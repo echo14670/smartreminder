@@ -6,15 +6,21 @@
 let androidTts = null
 let iosSynth = null
 
+function getPlatform() {
+  try {
+    return uni.getSystemInfoSync().platform || ''
+  } catch (e) {
+    return ''
+  }
+}
+
 export function speak(text) {
   if (!text) return
   // #ifdef APP-PLUS
-  // #ifdef APP-ANDROID
-  androidSpeak(text)
-  // #endif
-  // #ifdef APP-IOS
-  iosSpeak(text)
-  // #endif
+  const p = getPlatform()
+  if (p === 'android') androidSpeak(text)
+  else if (p === 'ios') iosSpeak(text)
+  else uni.showToast({ title: '语音播报：' + text, icon: 'none' })
   // #endif
   // #ifndef APP-PLUS
   uni.showToast({ title: '语音播报：' + text, icon: 'none' })
@@ -23,19 +29,17 @@ export function speak(text) {
 
 // 停止当前播报（用户确认关闭时调用）
 export function stopSpeaking() {
-  // #ifdef APP-ANDROID
+  // #ifdef APP-PLUS
   try {
     if (androidTts) androidTts.stop()
   } catch (e) {}
-  // #endif
-  // #ifdef APP-IOS
   try {
     if (iosSynth) iosSynth.stopSpeakingAtBoundary(1)
   } catch (e) {}
   // #endif
 }
 
-// #ifdef APP-ANDROID
+// #ifdef APP-PLUS
 function androidSpeak(text) {
   try {
     const main = plus.android.runtimeMainActivity()
@@ -62,7 +66,7 @@ function androidSpeak(text) {
 }
 // #endif
 
-// #ifdef APP-IOS
+// #ifdef APP-PLUS
 function iosSpeak(text) {
   try {
     const AVSpeechSynthesizer = plus.ios.importClass('AVSpeechSynthesizer')

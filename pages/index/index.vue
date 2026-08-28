@@ -64,25 +64,26 @@
     </view>
 
     <!-- 从机面板 -->
-    <view v-else class="card">
+    <view v-else class="card slave-card">
       <view class="header">
         <text class="page-title">从机</text>
         <text class="tag">本机：从机</text>
       </view>
       <view class="row"><text class="label">今日提醒</text><text :class="slaveEnabled ? 'state-on' : 'state-off'">{{ slaveEnabled ? '开' : '关' }}</text></view>
-      <view class="row"><text class="label">提醒数量</text><text class="value">{{ slaveReminders.length }} 条 · 每日 {{ totalSlaveTimes }} 次</text></view>
-      <view v-for="(r, idx) in slaveReminders" :key="r.id" class="reminder-item">
+      <view class="row"><text class="label">提醒数量</text><text class="value">{{ visibleSlaveReminders.length }} 条 · 每日 {{ totalSlaveTimes }} 次</text></view>
+      <view v-for="(r, idx) in visibleSlaveReminders" :key="r.id" class="reminder-item">
         <view class="row">
           <text class="label">{{ idx + 1 }}.{{ r.content || '（未填内容）' }}</text>
           <text :class="r.enabled ? 'state-on' : 'state-off'">{{ r.enabled ? '开' : '关' }}</text>
         </view>
         <view class="row"><text class="label">时间</text><text class="value">{{ r.times.join('、') || '--' }}</text></view>
       </view>
-      <!-- #ifdef APP-ANDROID -->
-      <view class="row"><text class="label">后台保活</text><text :class="keepAliveActive ? 'state-on' : 'state-off'">{{ keepAliveActive ? '前台服务运行中（息屏可播报）' : '未启用' }}</text></view>
+      <text v-if="!visibleSlaveReminders.length" class="empty-tip">主机当前未开启任何提醒</text>
+      <!-- #ifdef APP-PLUS -->
+      <view class="row" v-if="isAndroid"><text class="label">后台保活</text><text :class="keepAliveActive ? 'state-on' : 'state-off'">{{ keepAliveActive ? '前台服务运行中（息屏可播报）' : '未启用' }}</text></view>
       <!-- #endif -->
-      <!-- #ifdef APP-ANDROID -->
-      <button class="btn" type="warn" plain @click="openKeepAliveSettings">保活设置（电池白名单/自启动）</button>
+      <!-- #ifdef APP-PLUS -->
+      <button class="btn" type="warn" plain v-if="isAndroid" @click="openKeepAliveSettings">保活设置（电池白名单/自启动）</button>
       <!-- #endif -->
       <button class="btn" type="primary" @click="testSpeak">测试语音播报</button>
       <button class="btn" type="default" @click="syncNow">立即同步</button>
@@ -103,7 +104,7 @@
 
 <script>
 import { speak, stopSpeaking } from '@/utils/tts.js'
-// #ifdef APP-ANDROID
+// #ifdef APP-PLUS
 // 方案B：Android 息屏持续语音播报（前台服务保活插件，多提醒）
 import {
   startKeepAlive,
@@ -111,13 +112,14 @@ import {
   stopSpeech,
   stopKeepAlive,
   getState,
+  getSpeakContent,
   onStateChanged,
   getPendingRecords,
   clearPendingRecords
 } from '@/uni_modules/smart-reminder-keepalive'
 // #endif
 
-const REPEAT_INTERVAL = 10000
+const REPEAT_INTERVAL = 3000
 // 每日兜底拉取开关：推送失效时的保险（每天约 1 次云函数调用）
 const ENABLE_DAILY_FALLBACK = true
 // 仅在“重新回到前台”且即将到提醒时才同步，避免频繁打开 App 产生大量云函数调用
@@ -157,6 +159,8 @@ export default {
       // 保活
       keepAliveActive: false,
       keepAliveSupported: false,
+      // 通知权限只申请一次，避免每次 onShow 都弹框导致 App Hide/Show 死循环
+      _notifRequested: false,
       // 同步节流
       _coldStart: true,
       _lastSyncAt: 0,
@@ -173,9 +177,27 @@ export default {
         if (r.enabled) n += (r.times || []).length
       }
       return n
+    },
+    visibleSlaveReminders() {
+      return (this.slaveReminders || []).filter((r) => r.enabled !== false)
+    },
+    isAndroid() {
+      // #ifdef APP-PLUS
+      try {
+        return uni.getSystemInfoSync().platform === 'android'
+      } catch (e) {
+        return false
+      }
+      // #endif
+      // #ifndef APP-PLUS
+      return false
+      // #endif
     }
   },
   onLoad() {
+    let plat = '?'
+    try { plat = uni.getSystemInfoSync().platform || '?' } catch (e) {}
+    console.log('[SMARTREMINDER] onLoad 执行，mode=' + uni.getStorageSync('role') + '，实际平台=' + plat)
     this.mode = uni.getStorageSync('role') || ''
     const config = uni.getStorageSync('hostConfig') || {}
     this.normalizeHostConfig(config)
@@ -192,7 +214,7 @@ export default {
     }
     window.addEventListener('storage', this._h5Storage)
     // #endif
-    // #ifdef APP-ANDROID
+    // #ifdef APP-PLUS
     this.setupKeepAlive()
     // #endif
   },
@@ -205,8 +227,16 @@ export default {
       } else if (this.shouldSyncOnShow()) {
         this.syncNow()
       }
-      // #ifdef APP-ANDROID
+      // #ifdef APP-PLUS
       this.ensureNotificationPermission()
+      // 全屏提醒把 App 拉回前台后，若原生仍在播报，恢复“确认已收到”遮罩
+      if (this.isAndroid && this.keepAliveSupported) {
+        try {
+          if (getState() === 'speaking' && !this.reminderActive) {
+            this.reminderActive = true
+          }
+        } catch (e) {}
+      }
       // #endif
     }
   },
@@ -226,7 +256,7 @@ export default {
       uni.setStorageSync('role', mode)
       if (mode === 'slave') {
         this.syncNow()
-        // #ifdef APP-ANDROID
+        // #ifdef APP-PLUS
         this.ensureNotificationPermission()
         // #endif
       }
@@ -236,7 +266,7 @@ export default {
       this.clearDailyTimer()
       this.clearNextTimer()
       stopSpeaking()
-      // #ifdef APP-ANDROID
+      // #ifdef APP-PLUS
       this.safeStopKeepAlive()
       // #endif
       this.reminderActive = false
@@ -430,7 +460,7 @@ export default {
         this.lastSyncText = this.nowText()
         this._lastSyncAt = Date.now()
         this.scheduleDailySync()
-        // #ifdef APP-ANDROID
+        // #ifdef APP-PLUS
         this.syncKeepAlive()
         this.flushPendingRecords()
         // #endif
@@ -449,7 +479,8 @@ export default {
     },
     // 上传原生保活记录的本地待上传队列（覆盖“进程被杀”期间的触发）
     flushPendingRecords() {
-      // #ifdef APP-ANDROID
+      // #ifdef APP-PLUS
+      if (!this.isAndroid) return
       if (!this.keepAliveSupported) return
       let json = ''
       try {
@@ -485,16 +516,17 @@ export default {
       }).catch((err) => console.warn('补传提醒记录失败', err))
       // #endif
     },
-    // 每天在最早提醒前 2 分钟拉一次配置，作为推送失效时的兜底（每天最多 1 次）
+    // 固定每天 00:00 拉一次配置，作为推送失效时的兜底（每天最多 1 次）。
+    // 相比“最早提醒前 2 分钟”：若主机前一天新增了更早的提醒且推送失败，
+    // 0 点同步能保证当天一早就用上最新配置，不会漏掉这条更早的提醒。
     scheduleDailySync() {
       if (!ENABLE_DAILY_FALLBACK) return
       this.clearDailyTimer()
-      if (this.mode !== 'slave' || !this.slaveEnabled) return
-      const slots = this.collectSlots()
-      if (!slots.length) return
-      const earliest = slots.reduce((a, b) => (b.date < a.date ? b : a))
-      const target = earliest.date.getTime() - 2 * 60 * 1000
-      let delay = target - Date.now()
+      if (this.mode !== 'slave') return
+      const now = Date.now()
+      const midnight = new Date()
+      midnight.setHours(24, 0, 0, 0) // 下一个 00:00
+      let delay = midnight.getTime() - now
       if (delay < 0) delay += 24 * 60 * 60 * 1000
       this.dailyTimer = setTimeout(() => {
         const today = this.ymd(new Date())
@@ -587,7 +619,6 @@ export default {
     },
     startReminder(reminderId) {
       this.reminderActive = true
-      uni.vibrateLong()
       this.lastSpeakText = this.nowText()
       if (this.keepAliveActive) {
         // 方案B：由原生前台服务持续播报（息屏/后台也可靠），JS 只负责界面遮罩；
@@ -610,7 +641,7 @@ export default {
     confirmReminder() {
       this.stopRepeat()
       stopSpeaking()
-      // #ifdef APP-ANDROID
+      // #ifdef APP-PLUS
       this.safeStopSpeech()
       // #endif
       this.reminderActive = false
@@ -623,19 +654,35 @@ export default {
       }
     },
     testSpeak() {
-      uni.vibrateLong()
-      speak(this.remindContent || '语音播报测试')
+      // 弹出“确认已收到”遮罩，循环播报直到用户手动确认，便于验证持续播报
+      this.reminderActive = true
       this.lastSpeakText = '手动测试 ' + this.nowText()
+      const text = this.remindContent || '语音播报测试'
+      this.remindContent = text
+      this.speakContent()
+      this.stopRepeat()
+      this.repeatTimer = setInterval(() => {
+        this.speakContent()
+      }, REPEAT_INTERVAL)
     },
 
     // ---------- 方案B：Android 息屏持续播报（前台服务保活） ----------
     setupKeepAlive() {
-      // #ifdef APP-ANDROID
+      // #ifdef APP-PLUS
+      if (!this.isAndroid) {
+        this.keepAliveSupported = false
+        return
+      }
       try {
         this.keepAliveSupported = true
+        console.log('[保活] 插件可用，准备初始化')
         onStateChanged((state) => {
           if (state === 'speaking') {
             this.reminderActive = true
+            try {
+              const c = getSpeakContent()
+              if (c) this.remindContent = c
+            } catch (e) {}
             this.lastSpeakText = '原生播报中 ' + this.nowText()
           } else if (state === 'stopped') {
             this.stopRepeat()
@@ -646,15 +693,21 @@ export default {
         if (getState() === 'speaking') {
           this.reminderActive = true
         }
+        console.log('[保活] 初始化完成 keepAliveSupported=' + this.keepAliveSupported)
       } catch (e) {
-        console.warn('保活插件初始化失败（标准基座不支持原生配置，需自定义基座/云打包）', e)
+        console.warn('[保活] 插件初始化失败（极可能是标准基座，未包含 UTS 原生插件）', e)
         this.keepAliveSupported = false
       }
       // #endif
     },
     syncKeepAlive() {
-      // #ifdef APP-ANDROID
-      if (!this.keepAliveSupported) return
+      // #ifdef APP-PLUS
+      if (!this.isAndroid) return
+      if (!this.keepAliveSupported) {
+        console.warn('[保活] keepAliveSupported=false，跳过原生服务启动（标准基座）')
+        this.keepAliveActive = false
+        return
+      }
       const cfg = {
         enabled: this.slaveEnabled,
         reminders: (this.slaveReminders || []).map((r) => ({
@@ -665,20 +718,25 @@ export default {
         }))
       }
       const json = JSON.stringify(cfg)
+      console.log('[保活] 尝试启动/更新，enabled=' + this.slaveEnabled + ' 提醒数=' + (this.slaveReminders || []).length)
       try {
         let ok = updateReminder(json)
+        console.log('[保活] updateReminder=' + ok)
         if (!ok) {
           ok = startKeepAlive(json)
+          console.log('[保活] startKeepAlive(fallback)=' + ok)
         }
         this.keepAliveActive = !!ok
       } catch (e) {
-        console.warn('保活插件调用失败', e)
+        console.warn('[保活] 插件调用失败', e)
         this.keepAliveActive = false
       }
+      console.log('[保活] 最终 keepAliveActive=' + this.keepAliveActive)
       // #endif
     },
     safeStopSpeech() {
-      // #ifdef APP-ANDROID
+      // #ifdef APP-PLUS
+      if (!this.isAndroid) return
       try {
         stopSpeech()
       } catch (e) {
@@ -687,7 +745,8 @@ export default {
       // #endif
     },
     safeStopKeepAlive() {
-      // #ifdef APP-ANDROID
+      // #ifdef APP-PLUS
+      if (!this.isAndroid) return
       try {
         stopKeepAlive()
       } catch (e) {
@@ -697,7 +756,10 @@ export default {
       // #endif
     },
     ensureNotificationPermission() {
-      // #ifdef APP-ANDROID
+      // #ifdef APP-PLUS
+      if (!this.isAndroid) return
+      if (this._notifRequested) return
+      this._notifRequested = true
       try {
         plus.android.requestPermissions(['android.permission.POST_NOTIFICATIONS'], () => {
         }, (err) => {
@@ -710,7 +772,8 @@ export default {
     },
     // 引导用户设置：电池优化白名单 + 应用详情页（各品牌“自启动/后台运行”都在设置里）
     openKeepAliveSettings() {
-      // #ifdef APP-ANDROID
+      // #ifdef APP-PLUS
+      if (!this.isAndroid) return
       try {
         const main = plus.android.runtimeMainActivity()
         const Intent = plus.android.importClass('android.content.Intent')
@@ -844,6 +907,34 @@ export default {
   color: #ff9900;
   font-weight: bold;
 }
+.slave-card .page-title {
+  font-size: 46rpx;
+}
+.slave-card .tag {
+  font-size: 28rpx;
+}
+.slave-card .label {
+  font-size: 36rpx;
+}
+.slave-card .value {
+  font-size: 36rpx;
+}
+.slave-card .state-on,
+.slave-card .state-off {
+  font-size: 36rpx;
+}
+.slave-card .btn {
+  font-size: 36rpx;
+  height: 92rpx;
+  line-height: 92rpx;
+}
+.empty-tip {
+  display: block;
+  margin-top: 30rpx;
+  font-size: 32rpx;
+  color: #999999;
+  text-align: center;
+}
 .time-value {
   font-size: 34rpx;
   color: #007aff;
@@ -961,23 +1052,26 @@ export default {
   align-items: center;
 }
 .mask-title {
-  font-size: 40rpx;
+  font-size: 52rpx;
   font-weight: bold;
   color: #e64340;
 }
 .mask-content {
   margin-top: 30rpx;
-  font-size: 34rpx;
+  font-size: 48rpx;
   color: #222222;
   text-align: center;
 }
 .mask-sub {
   margin-top: 16rpx;
-  font-size: 26rpx;
+  font-size: 34rpx;
   color: #999999;
 }
 .mask-btn {
   margin-top: 50rpx;
   width: 100%;
+  font-size: 40rpx;
+  height: 100rpx;
+  line-height: 100rpx;
 }
 </style>
